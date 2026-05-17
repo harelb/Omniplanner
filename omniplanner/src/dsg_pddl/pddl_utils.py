@@ -63,3 +63,8 @@ def pddl_char_to_dsg_char(c):
             return "P"
         case _:
             return c
+
+
+def dsg_char_to_pddl_char(c: str) -> str:
+    """Inverse of pddl_char_to_dsg_char. 'O' -> 'o', 'P' -> 'p', 'R' -> 'r'."""
+    return c.lower()

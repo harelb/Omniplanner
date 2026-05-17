@@ -35,6 +35,21 @@ GOAL_RELEVANT_MAX_REGION_PLACES = int(
 )
 
 
+class MissingSymbolError(Exception):
+    """Raised when a PDDL symbol cannot be grounded against the DSG.
+
+    Way 1 of the agentic open-set pipeline catches this to know which symbol
+    the agent must discover (or create) before grounding can succeed.
+    """
+    def __init__(self, symbol, pddl_symbol: str, dsg_char: str, index: int, original: Exception | None = None):
+        self.symbol = symbol            # spark_dsg.NodeSymbol
+        self.pddl_symbol = pddl_symbol  # e.g. "o3"
+        self.dsg_char = dsg_char        # e.g. "O"
+        self.index = index              # e.g. 3
+        self.original = original
+        super().__init__(f"Could not find node {symbol} in DSG (pddl symbol '{pddl_symbol}')")
+
+
 def generate_symbol_connectivity(G, symbols):
     layer_planner = LayerPlanner(G, spark_dsg.DsgLayers.MESH_PLACES)
 
@@ -331,14 +346,18 @@ def add_symbol_positions(G, symbols):
     for s in symbols:
         if s.position is not None:
             continue
-        else:
-            pddl_symbol_char = s.symbol[0]
-            dsg_symbol_char = pddl_char_to_dsg_char(pddl_symbol_char)
-            ns = spark_dsg.NodeSymbol(dsg_symbol_char, int(s.symbol[1:]))
-            position = G.get_node(ns).attributes.position[:2]
-            if position is None:
-                raise Exception(f"Could not find node {ns} in DSG")
-            s.position = position
+        pddl_symbol_char = s.symbol[0]
+        dsg_symbol_char = pddl_char_to_dsg_char(pddl_symbol_char)
+        index = int(s.symbol[1:])
+        ns = spark_dsg.NodeSymbol(dsg_symbol_char, index)
+        try:
+            node = G.get_node(ns)
+            position = node.attributes.position[:2]
+        except Exception as e:
+            raise MissingSymbolError(ns, s.symbol, dsg_symbol_char, index, original=e) from e
+        if position is None:
+            raise MissingSymbolError(ns, s.symbol, dsg_symbol_char, index)
+        s.position = position
     return symbols
 
 
