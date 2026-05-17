@@ -1,7 +1,6 @@
 """Non-ROS PDDL plan compilation. Mirrors omniplanner_ros.pddl_planner_ros.compile_pddl_plan
 but without rclpy dependency, so the kinematic simulator can run standalone."""
 
-import uuid
 from typing import Any
 
 import numpy as np
