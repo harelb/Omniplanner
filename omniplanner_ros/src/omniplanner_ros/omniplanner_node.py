@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -100,12 +101,14 @@ class RobotPlanningAdaptor:
             qos_profile or 1,
         )
 
-    def get_pose(self, parent_frame):
+    def get_pose(self, parent_frame, timeout_s: float = 1.0):
         self.ros_logger.info(
             f"Looking up pose for {self.name} ({parent_frame}->{self.child_frame})"
         )
         try:
-            return get_robot_pose(self.tf_buffer, parent_frame, self.child_frame)
+            return get_robot_pose(
+                self.tf_buffer, parent_frame, self.child_frame, timeout_s
+            )
         except tf2_ros.TransformException as e:
             self.ros_logger.warning(str(e))
             return None
@@ -142,25 +145,36 @@ class PhoenixRobotConfig(RobotConfig):
 class OmniplannerNodeConfig(Config):
     robots: List[config_field("robot_adaptor")] = field(default_factory=list)
     planners: Dict[str, PlannerConfig] = field(default_factory=dict)
+    # How long (s) to wait for a robot's transform before treating it as
+    # unavailable. Small so offline robots don't stall planning; online robots
+    # resolve immediately regardless. See get_robot_pose.
+    tf_timeout_s: float = 0.2
 
     @classmethod
     def load(cls, path: str):
         return Config.load(OmniplannerNodeConfig, path)
 
 
-def get_robot_pose(tf_buffer, parent_frame: str, child_frame: str) -> np.ndarray:
+def get_robot_pose(
+    tf_buffer, parent_frame: str, child_frame: str, timeout_s: float = 1.0
+) -> np.ndarray:
     """
     Looks up the transform from parent_frame to child_frame and returns [x, y, z, yaw].
 
+    ``timeout_s`` is how long to wait for the transform to become available. For
+    an online robot publishing TF continuously, the transform is already in the
+    buffer and this returns immediately regardless of the timeout; the timeout is
+    only spent waiting on an *absent* transform (e.g. an offline robot), so a
+    small value keeps planning responsive when robots are offline.
     """
-    # TODO: use Time(0) instead of now?
+    # Time() is time 0, i.e. "latest available" in tf2.
     try:
         now = rclpy.time.Time()
         tf_buffer.can_transform(
             parent_frame,
             child_frame,
             now,
-            timeout=rclpy.duration.Duration(seconds=1.0),
+            timeout=rclpy.duration.Duration(seconds=timeout_s),
         )
         transform = tf_buffer.lookup_transform(parent_frame, child_frame, now)
 
@@ -176,6 +190,44 @@ def get_robot_pose(tf_buffer, parent_frame: str, child_frame: str) -> np.ndarray
     except tf2_ros.TransformException as e:
         print(f"Transform error: {e}")
         raise
+
+
+class LazyRobotPoses(Mapping):
+    """Robot poses looked up from TF on demand and cached.
+
+    Behaves like the eager ``{robot_name: pose_or_None}`` dict it replaces
+    (iteration yields every configured robot; offline robots resolve to None),
+    but a robot's transform is only looked up the first time it is accessed.
+    Single-robot planning therefore touches exactly one robot, so the per-offline
+    -robot TF timeout is not paid for robots that have no goal assigned. The
+    multi-robot grounders that iterate every robot still resolve them all, with
+    offline robots filtered out downstream via ``pose is not None`` as before.
+    """
+
+    def __init__(self, robot_adaptors, parent_frame, timeout_s=1.0):
+        self._adaptors = robot_adaptors
+        self._parent_frame = parent_frame
+        self._timeout_s = timeout_s
+        self._cache = {}
+
+    def __getitem__(self, name):
+        if name not in self._adaptors:
+            raise KeyError(name)
+        if name not in self._cache:
+            self._cache[name] = self._adaptors[name].get_pose(
+                self._parent_frame, self._timeout_s
+            )
+        return self._cache[name]
+
+    def __iter__(self):
+        return iter(self._adaptors)
+
+    def __len__(self):
+        return len(self._adaptors)
+
+    def resolved(self):
+        """Poses actually looked up so far (for logging without forcing lookups)."""
+        return dict(self._cache)
 
 
 class OmniPlannerRos(Node):
@@ -298,10 +350,11 @@ class OmniPlannerRos(Node):
         self.heartbeat_pub.publish(msg)
 
     def get_robot_poses(self, dsg_frame):
-        pose_dict = {}
-        for name, pose_adaptor in self.robot_adaptors.items():
-            pose_dict[name] = pose_adaptor.get_pose(dsg_frame)
-        return pose_dict
+        # Lazy: only robots whose pose is actually accessed during grounding get
+        # a TF lookup, so robots without an assigned goal cost nothing.
+        return LazyRobotPoses(
+            self.robot_adaptors, dsg_frame, timeout_s=self.config.tf_timeout_s
+        )
 
     def register_plugin(self, name, plugin):
         self.get_logger().info(f"Registering subscription plugin {name}")
@@ -321,14 +374,18 @@ class OmniPlannerRos(Node):
                 self.current_planner = name
                 self.plan_time_start = time.time()
 
+            # Poses are resolved lazily; avoid formatting the whole mapping here
+            # (that would force a TF lookup for every configured robot).
             robot_poses = self.get_robot_poses(self.dsg_frame)
-            self.get_logger().info(f"Planning with robot poses {robot_poses}")
 
             plan_request = callback(msg, robot_poses)
             with self.dsg_lock:
                 plans = full_planning_pipeline(
                     plan_request, self.dsg_last, self.feedback
                 )
+            self.get_logger().info(
+                f"Planned using robot poses {robot_poses.resolved()}"
+            )
 
             compiled_plans = compile_plan(self.robot_adaptors, self.dsg_frame, plans)
             plan_dict = collect_plans(compiled_plans)

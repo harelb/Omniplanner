@@ -2,6 +2,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import datetime
 
@@ -9,6 +10,11 @@ from dsg_pddl.pddl_grounding import GroundedPddlProblem
 from dsg_pddl.pddl_utils import lisp_string_to_ast
 
 logger = logging.getLogger(__name__)
+
+# Hard wall-clock limits (seconds) passed to Fast Downward so a pathological
+# problem can't hang the planner. None disables a limit. Overridable via env.
+FD_SEARCH_TIME_LIMIT = os.getenv("OMNIPLANNER_FD_SEARCH_TIME_LIMIT", "60")
+FD_TRANSLATE_TIME_LIMIT = os.getenv("OMNIPLANNER_FD_TRANSLATE_TIME_LIMIT", "60")
 
 
 def solve_pddl(problem: GroundedPddlProblem):
@@ -44,6 +50,10 @@ def solve_pddl(problem: GroundedPddlProblem):
             fo.write(problem.domain.to_string())
 
         command = ["fast-downward"]
+        if FD_TRANSLATE_TIME_LIMIT not in (None, "", "0"):
+            command += ["--translate-time-limit", str(FD_TRANSLATE_TIME_LIMIT)]
+        if FD_SEARCH_TIME_LIMIT not in (None, "", "0"):
+            command += ["--search-time-limit", str(FD_SEARCH_TIME_LIMIT)]
         command += ["--plan-file", plan_fn]
         command += [domain_fn]
         command += [problem_fn]
@@ -52,9 +62,18 @@ def solve_pddl(problem: GroundedPddlProblem):
             "let(hff, ff(), let(hcea, cea(), lazy_greedy([hff, hcea], preferred=[hff, hcea])))",
         ]
 
-        logger.warning(f"Calling: {command}")
-        return_code = subprocess.run(command)
-        logger.warning(f"Return code: {return_code}")
+        logger.info(f"Calling: {command}")
+        fd_start = time.perf_counter()
+        # Capture FD output instead of letting it stream to the terminal/log;
+        # surface it only on failure or at DEBUG.
+        proc = subprocess.run(command, capture_output=True, text=True)
+        fd_elapsed = time.perf_counter() - fd_start
+        logger.info(
+            f"fast-downward finished in {fd_elapsed:.3f}s (return code {proc.returncode})"
+        )
+        logger.debug("fast-downward stdout:\n%s", proc.stdout)
+        if proc.stderr:
+            logger.debug("fast-downward stderr:\n%s", proc.stderr)
 
         if os.path.exists(plan_fn):
             with open(plan_fn, "r") as fo:
@@ -67,6 +86,8 @@ def solve_pddl(problem: GroundedPddlProblem):
             logger.warning(
                 f"Planning failed. Please see {debug_fn} for the failed problem file."
             )
+            logger.warning("fast-downward stdout:\n%s", proc.stdout)
+            logger.warning("fast-downward stderr:\n%s", proc.stderr)
             with open(debug_fn, "w") as fo:
                 fo.write(problem.problem_str)
             raise Exception(
