@@ -13,6 +13,7 @@ import os
 import sys
 
 import numpy as np
+import spark_dsg
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..", "examples")
@@ -20,7 +21,10 @@ sys.path.insert(
 from utils import build_test_dsg  # noqa: E402
 
 from dsg_pddl.pddl_grounding import PddlDomain, PddlGoal  # noqa: E402
-from dsg_pddl.dsg_pddl_grounding import ground_problem  # noqa: E402
+from dsg_pddl.dsg_pddl_grounding import (  # noqa: E402
+    generate_place_containment,
+    ground_problem,
+)
 from dsg_pddl.dsg_pddl_planning import make_plan  # noqa: E402
 from importlib.resources import as_file, files  # noqa: E402
 import dsg_pddl.domains  # noqa: E402
@@ -124,6 +128,115 @@ def test_object_in_region_already_satisfied_yields_empty_plan():
     )
     plan = make_plan(gp, G)
     assert plan.symbolic_actions == []
+
+
+def _build_real_graph_shape_dsg():
+    """A DSG mirroring the real hydra/camp-graph shape rather than the toy
+    ``build_test_dsg`` fixture: ROOMS parent MESH_PLACES-layer places
+    directly (region_injector's actual membership edge), with MESH_PLACES
+    registered at a layer id BELOW ROOMS (like a real graph) so insert_edge
+    actually records parent/child (see generate_place_containment's docstring
+    and the task-D1 report for why layer id 20 -- as used by build_test_dsg --
+    can never do this).
+
+    Mesh-place indices (7, 8, 9, 10) are deliberately disjoint from any 3D
+    PLACES-layer indices -- indeed no 3D PLACES nodes are added at all -- so
+    this graph cannot be satisfied by accidentally reusing PLACES-layer
+    containment (the pre-fix, PLACES-only code path) or by index collision
+    (p7/p8 do not exist anywhere).
+    """
+    G = spark_dsg.DynamicSceneGraph()
+    G.add_layer(2, "O", spark_dsg.DsgLayers.OBJECTS)
+    G.add_layer(3, "P", spark_dsg.DsgLayers.MESH_PLACES)
+    G.add_layer(4, "R", spark_dsg.DsgLayers.ROOMS)
+
+    room0 = spark_dsg.RoomNodeAttributes()
+    room0.position = np.array([0, 0, 0])
+    room0.semantic_label = 0
+    G.add_node(spark_dsg.DsgLayers.ROOMS, spark_dsg.NodeSymbol("R", 0).value, room0)
+
+    room1 = spark_dsg.RoomNodeAttributes()
+    room1.position = np.array([10, 0, 0])
+    room1.semantic_label = 1
+    G.add_node(spark_dsg.DsgLayers.ROOMS, spark_dsg.NodeSymbol("R", 1).value, room1)
+
+    def add_mesh_place(idx, pos):
+        p = spark_dsg.PlaceNodeAttributes()
+        p.position = np.array(pos)
+        p.semantic_label = 4  # ground
+        G.add_node(
+            spark_dsg.DsgLayers.MESH_PLACES, spark_dsg.NodeSymbol("P", idx).value, p
+        )
+
+    add_mesh_place(7, [0, 0, 0])
+    add_mesh_place(8, [1, 0, 0])
+    add_mesh_place(9, [9, 0, 0])
+    add_mesh_place(10, [10, 0, 0])
+
+    obj0 = spark_dsg.ObjectNodeAttributes()
+    obj0.position = np.array([0.1, 0, 0])
+    obj0.semantic_label = 34  # box
+    G.add_node(spark_dsg.DsgLayers.OBJECTS, spark_dsg.NodeSymbol("O", 0).value, obj0)
+
+    # Rooms parent MESH_PLACES places directly (no 3D PLACES layer involved).
+    G.insert_edge(
+        spark_dsg.NodeSymbol("R", 0).value, spark_dsg.NodeSymbol("P", 7).value
+    )
+    G.insert_edge(
+        spark_dsg.NodeSymbol("R", 0).value, spark_dsg.NodeSymbol("P", 8).value
+    )
+    G.insert_edge(
+        spark_dsg.NodeSymbol("R", 1).value, spark_dsg.NodeSymbol("P", 9).value
+    )
+    G.insert_edge(
+        spark_dsg.NodeSymbol("R", 1).value, spark_dsg.NodeSymbol("P", 10).value
+    )
+
+    # Places graph so LayerPlanner/goto-poi routing has a path to walk.
+    G.insert_edge(
+        spark_dsg.NodeSymbol("P", 7).value, spark_dsg.NodeSymbol("P", 8).value
+    )
+    G.insert_edge(
+        spark_dsg.NodeSymbol("P", 8).value, spark_dsg.NodeSymbol("P", 9).value
+    )
+    G.insert_edge(
+        spark_dsg.NodeSymbol("P", 9).value, spark_dsg.NodeSymbol("P", 10).value
+    )
+
+    G.insert_edge(
+        spark_dsg.NodeSymbol("P", 7).value, spark_dsg.NodeSymbol("O", 0).value
+    )
+
+    return G
+
+
+def test_generate_place_containment_real_graph_shape():
+    # Direct unit test of generate_place_containment against the real-graph
+    # shape (rooms parent MESH_PLACES directly, no 3D PLACES layer at all).
+    # This is exactly what the PLACES-only (post-652b1f3, pre-fix) code
+    # returned [] for -- G.get_layer(PLACES) is present-but-empty on this
+    # graph, so a PLACES-only walk finds no place nodes and thus no facts.
+    G = _build_real_graph_shape_dsg()
+    facts = generate_place_containment(G)
+    fact_set = set(facts)
+    assert ("place-in-region", "p7", "r0") in fact_set
+    assert ("place-in-region", "p8", "r0") in fact_set
+    assert ("place-in-region", "p9", "r1") in fact_set
+    assert ("place-in-region", "p10", "r1") in fact_set
+
+
+def test_goal_relevant_object_in_region_plan_real_graph_shape():
+    # End-to-end regression: object-in-region must ground and plan on a DSG
+    # shaped like a real hydra/camp graph (rooms parenting MESH_PLACES
+    # directly), which the toy build_test_dsg fixture cannot exercise/fake.
+    G = _build_real_graph_shape_dsg()
+    domain = _load_domain("RegionObjectRearrangementDomain.pddl", "goal_relevant")
+    goal = PddlGoal(robot_id="euclid", pddl_goal="(and (object-in-region o0 r1))")
+    grounded = ground_problem(domain, G, {"euclid": np.array([0.0, 0.0])}, goal)
+    gp = grounded.value
+    actions = _plan_action_names(G, gp)
+    assert "pick-object" in actions
+    assert "place-object" in actions
 
 
 if __name__ == "__main__":

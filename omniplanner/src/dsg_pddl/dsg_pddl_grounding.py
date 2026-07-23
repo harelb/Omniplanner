@@ -271,34 +271,90 @@ def generate_object_containment(G):
 
 
 def generate_place_containment(G):
-    # NOTE: this deliberately walks the 3D PLACES layer ("p"), not MESH_PLACES
-    # ("P"). MESH_PLACES is a non-primary/orthogonal spark_dsg layer partition
-    # (confirmed via G.layer_keys: it has no un-partitioned "20" key, only the
-    # "20[P]" partition key, unlike OBJECTS/PLACES/ROOMS/BUILDINGS), so its
-    # nodes can never acquire a graph parent via insert_edge -- node.parents()
-    # is always empty regardless of which edges are inserted. The PLACES layer
-    # nodes ARE parented under ROOMS in the normal hierarchy, and normalize_symbol
-    # collapses "p<i>"/"P<i>" to the same PDDL "place" symbol string, so reusing
-    # the 3D layer's containment here correctly yields place-in-region facts for
-    # the "place" objects used throughout this module (which are keyed off
-    # MESH_PLACES elsewhere, e.g. get_places_layer / object_current_place).
-    places_layer = G.get_layer(spark_dsg.DsgLayers.PLACES)
+    """Build ('place-in-region', place_sym, room_sym) facts.
 
-    containments = []
+    Every other place-symbol source in this module (get_places_layer,
+    extract_all_symbols, object_current_place, the distance LayerPlanner, ...)
+    is keyed off MESH_PLACES ("P"). To keep place-in-region facts consistent
+    with those, this walks BOTH of the two DSG shapes that put rooms and
+    places in a parent/child relationship and unions (deduplicates) the
+    resulting facts:
 
-    for node in places_layer.nodes:
-        parents = node.parents()
-        for parent in parents:
-            if parent is not None:
-                containments.append(
+      (a) MESH_PLACES nodes parented directly under ROOMS. This is the real
+          hydra/camp-graph shape: the region_injector adds room->MESH_PLACES
+          membership, and the 3D PLACES layer may be empty entirely. This is
+          also the original (pre object-in-region-derived-predicate) behavior
+          of this function.
+      (b) ROOMS nodes whose children resolve to place-type nodes (3D PLACES
+          or MESH_PLACES). This covers scene graphs (e.g. the synthetic test
+          fixture in examples/utils.py:build_test_dsg) where MESH_PLACES is
+          registered as a non-primary/orthogonal layer partition (e.g. layer
+          id 20, above ROOMS at layer id 4) that can never acquire a graph
+          parent via insert_edge -- node.parents() stays empty regardless of
+          which edges are inserted -- so those fixtures instead parent rooms
+          directly over the 3D PLACES layer.
+
+    normalize_symbol collapses "p<i>"/"P<i>" to the same string, so facts from
+    either source key correctly against the "place"-typed PDDL symbols used
+    throughout this module.
+    """
+    containments = set()
+
+    try:
+        places_layer_2d = G.get_layer(spark_dsg.DsgLayers.MESH_PLACES)
+    except Exception:
+        try:
+            places_layer_2d = G.get_layer(20)
+        except Exception:
+            places_layer_2d = None
+
+    # (a) MESH_PLACES nodes' parents -- the real-graph shape.
+    if places_layer_2d is not None:
+        for node in places_layer_2d.nodes:
+            for parent in node.parents():
+                if parent is not None:
+                    containments.add(
+                        (
+                            "place-in-region",
+                            normalize_symbol(node.id.str(True)),
+                            normalize_symbol(spark_dsg.NodeSymbol(parent).str(True)),
+                        )
+                    )
+
+    try:
+        places_layer_3d = G.get_layer(spark_dsg.DsgLayers.PLACES)
+    except Exception:
+        places_layer_3d = None
+
+    place_node_ids = set()
+    if places_layer_2d is not None:
+        place_node_ids.update(node.id.value for node in places_layer_2d.nodes)
+    if places_layer_3d is not None:
+        place_node_ids.update(node.id.value for node in places_layer_3d.nodes)
+
+    try:
+        rooms_layer = G.get_layer(spark_dsg.DsgLayers.ROOMS)
+    except Exception:
+        rooms_layer = None
+
+    # (b) ROOMS nodes' children that are place-type nodes -- the toy-fixture
+    # shape (rooms parent the 3D PLACES layer instead of/in addition to
+    # MESH_PLACES).
+    if rooms_layer is not None:
+        for room_node in rooms_layer.nodes:
+            room_sym = normalize_symbol(room_node.id.str(True))
+            for child in room_node.children():
+                if child not in place_node_ids:
+                    continue
+                containments.add(
                     (
                         "place-in-region",
-                        normalize_symbol(node.id.str(True)),
-                        normalize_symbol(spark_dsg.NodeSymbol(parent).str(True)),
+                        normalize_symbol(spark_dsg.NodeSymbol(child).str(True)),
+                        room_sym,
                     )
                 )
 
-    return containments
+    return sorted(containments)
 
 
 def generate_dense_init(G, symbols_of_interest, start_symbol):
@@ -507,8 +563,22 @@ def generate_goal_relevant_pddl(
                     _, p, r = fact
                     region_to_places.setdefault(r, []).append(p)
             members = region_to_places.get(name, [])
+            valid_members = []
+            for p in members:
+                if p not in by_name:
+                    logger.warning(
+                        "Region '%s' contains place '%s' from "
+                        "generate_place_containment, but no scene symbol "
+                        "named '%s' exists (place-layer index mismatch?); "
+                        "skipping it.",
+                        name,
+                        p,
+                        p,
+                    )
+                    continue
+                valid_members.append(p)
             members = sorted(
-                members,
+                valid_members,
                 key=lambda p: float(
                     np.linalg.norm(place_sym_to_pos[p] - initial_position)
                 ),
