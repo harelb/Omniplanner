@@ -276,9 +276,8 @@ def generate_place_containment(G):
     Every other place-symbol source in this module (get_places_layer,
     extract_all_symbols, object_current_place, the distance LayerPlanner, ...)
     is keyed off MESH_PLACES ("P"). To keep place-in-region facts consistent
-    with those, this walks BOTH of the two DSG shapes that put rooms and
-    places in a parent/child relationship and unions (deduplicates) the
-    resulting facts:
+    with those, this walks the real-graph shape first and only falls back to
+    a second shape if that yields nothing:
 
       (a) MESH_PLACES nodes parented directly under ROOMS. This is the real
           hydra/camp-graph shape: the region_injector adds room->MESH_PLACES
@@ -294,12 +293,17 @@ def generate_place_containment(G):
           which edges are inserted -- so those fixtures instead parent rooms
           directly over the 3D PLACES layer.
 
-    normalize_symbol collapses "p<i>"/"P<i>" to the same string, so facts from
-    either source key correctly against the "place"-typed PDDL symbols used
-    throughout this module.
+    (b) is run ONLY IF (a) produced zero facts -- it is a fallback, not a
+    union. On real hydra maps, rooms parent 3D PLACES nodes *in addition to*
+    MESH_PLACES nodes, and normalize_symbol's case-collapsing ("p<i>"/"P<i>"
+    collide, since both layers number from 0) means path (b)'s 3D-place-keyed
+    facts alias unrelated MESH_PLACES symbols whenever the two layers share an
+    index -- corrupting place-in-region truth values for downstream full-scope
+    and multirobot consumers. Falling back only when (a) is empty preserves
+    the toy fixture (whose MESH_PLACES layer never has parents, so (a) is
+    always empty there) while restoring exact pre-change behavior -- (a) only
+    -- on real graphs.
     """
-    containments = set()
-
     try:
         places_layer_2d = G.get_layer(spark_dsg.DsgLayers.MESH_PLACES)
     except Exception:
@@ -309,17 +313,21 @@ def generate_place_containment(G):
             places_layer_2d = None
 
     # (a) MESH_PLACES nodes' parents -- the real-graph shape.
+    containments_a = set()
     if places_layer_2d is not None:
         for node in places_layer_2d.nodes:
             for parent in node.parents():
                 if parent is not None:
-                    containments.add(
+                    containments_a.add(
                         (
                             "place-in-region",
                             normalize_symbol(node.id.str(True)),
                             normalize_symbol(spark_dsg.NodeSymbol(parent).str(True)),
                         )
                     )
+
+    if containments_a:
+        return sorted(containments_a)
 
     try:
         places_layer_3d = G.get_layer(spark_dsg.DsgLayers.PLACES)
@@ -337,16 +345,17 @@ def generate_place_containment(G):
     except Exception:
         rooms_layer = None
 
-    # (b) ROOMS nodes' children that are place-type nodes -- the toy-fixture
-    # shape (rooms parent the 3D PLACES layer instead of/in addition to
+    # (b) ROOMS nodes' children that are place-type nodes -- fallback only,
+    # for the toy-fixture shape (rooms parent the 3D PLACES layer instead of
     # MESH_PLACES).
+    containments_b = set()
     if rooms_layer is not None:
         for room_node in rooms_layer.nodes:
             room_sym = normalize_symbol(room_node.id.str(True))
             for child in room_node.children():
                 if child not in place_node_ids:
                     continue
-                containments.add(
+                containments_b.add(
                     (
                         "place-in-region",
                         normalize_symbol(spark_dsg.NodeSymbol(child).str(True)),
@@ -354,7 +363,7 @@ def generate_place_containment(G):
                     )
                 )
 
-    return sorted(containments)
+    return sorted(containments_b)
 
 
 def generate_dense_init(G, symbols_of_interest, start_symbol):

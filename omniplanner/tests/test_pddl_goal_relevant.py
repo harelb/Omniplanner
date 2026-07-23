@@ -225,6 +225,69 @@ def test_generate_place_containment_real_graph_shape():
     assert ("place-in-region", "p10", "r1") in fact_set
 
 
+def _build_real_graph_shape_dsg_with_places_collision():
+    """Real-graph shape (as in ``_build_real_graph_shape_dsg``) PLUS a 3D
+    PLACES layer that rooms also parent, with an index collision against
+    MESH_PLACES: 3D place "p7" (room R1's child) collides post-
+    normalize_symbol with mesh place "P7" (room R0's child, from path (a)).
+
+    This is the shape path (b) was wrongly emitting facts for even when path
+    (a) already had the authoritative answer: if (b) ran unconditionally, it
+    would add ("place-in-region", "p7", "r1") -- aliasing R0's real mesh
+    place P7 into R1 -- alongside (a)'s correct ("place-in-region", "p7",
+    "r0"). generate_place_containment must return ONLY the path (a) facts.
+    """
+    G = _build_real_graph_shape_dsg()
+
+    G.add_layer(5, "p", spark_dsg.DsgLayers.PLACES)
+
+    def add_3d_place(idx, pos):
+        p = spark_dsg.PlaceNodeAttributes()
+        p.position = np.array(pos)
+        G.add_node(
+            spark_dsg.DsgLayers.PLACES, spark_dsg.NodeSymbol("p", idx).value, p
+        )
+
+    # Colliding index: 3D place p7 vs. mesh place P7 (both normalize to "p7").
+    add_3d_place(7, [0, 5, 0])
+    add_3d_place(9, [9, 5, 0])
+
+    # Rooms also parent the 3D PLACES nodes (the toy-fixture-style edge),
+    # deliberately crossing rooms so the alias would be detectable: p7 is
+    # parented under R1, not R0 (where mesh P7 actually lives).
+    G.insert_edge(
+        spark_dsg.NodeSymbol("R", 1).value, spark_dsg.NodeSymbol("p", 7).value
+    )
+    G.insert_edge(
+        spark_dsg.NodeSymbol("R", 0).value, spark_dsg.NodeSymbol("p", 9).value
+    )
+
+    return G
+
+
+def test_generate_place_containment_path_b_is_fallback_only():
+    # When path (a) (MESH_PLACES-parents) yields facts, path (b) (ROOMS
+    # children resolving to place-type nodes) must NOT also run -- it is a
+    # fallback for graphs where (a) is empty, not a union. Otherwise
+    # normalize_symbol's p<i>/P<i> case-collapse aliases unrelated symbols.
+    G = _build_real_graph_shape_dsg_with_places_collision()
+    facts = generate_place_containment(G)
+    fact_set = set(facts)
+
+    # Only the path (a) (MESH_PLACES-derived) facts should be present.
+    assert fact_set == {
+        ("place-in-region", "p7", "r0"),
+        ("place-in-region", "p8", "r0"),
+        ("place-in-region", "p9", "r1"),
+        ("place-in-region", "p10", "r1"),
+    }
+
+    # In particular, no aliased/duplicate fact from the colliding 3D place
+    # nodes (which would incorrectly claim p7 is in r1, or p9 is in r0).
+    assert ("place-in-region", "p7", "r1") not in fact_set
+    assert ("place-in-region", "p9", "r0") not in fact_set
+
+
 def test_goal_relevant_object_in_region_plan_real_graph_shape():
     # End-to-end regression: object-in-region must ground and plan on a DSG
     # shaped like a real hydra/camp graph (rooms parenting MESH_PLACES
