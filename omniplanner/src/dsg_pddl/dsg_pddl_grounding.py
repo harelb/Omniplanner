@@ -271,14 +271,22 @@ def generate_object_containment(G):
 
 
 def generate_place_containment(G):
-    try:
-        places_layer_2d = G.get_layer(spark_dsg.DsgLayers.MESH_PLACES)
-    except Exception:
-        places_layer_2d = G.get_layer(20)
+    # NOTE: this deliberately walks the 3D PLACES layer ("p"), not MESH_PLACES
+    # ("P"). MESH_PLACES is a non-primary/orthogonal spark_dsg layer partition
+    # (confirmed via G.layer_keys: it has no un-partitioned "20" key, only the
+    # "20[P]" partition key, unlike OBJECTS/PLACES/ROOMS/BUILDINGS), so its
+    # nodes can never acquire a graph parent via insert_edge -- node.parents()
+    # is always empty regardless of which edges are inserted. The PLACES layer
+    # nodes ARE parented under ROOMS in the normal hierarchy, and normalize_symbol
+    # collapses "p<i>"/"P<i>" to the same PDDL "place" symbol string, so reusing
+    # the 3D layer's containment here correctly yields place-in-region facts for
+    # the "place" objects used throughout this module (which are keyed off
+    # MESH_PLACES elsewhere, e.g. get_places_layer / object_current_place).
+    places_layer = G.get_layer(spark_dsg.DsgLayers.PLACES)
 
     containments = []
 
-    for node in places_layer_2d.nodes:
+    for node in places_layer.nodes:
         parents = node.parents()
         for parent in parents:
             if parent is not None:
@@ -384,6 +392,7 @@ _NON_SYMBOL_TOKENS = {
     "region", "place", "dsg_object", "point-of-interest", "object",
     "at-poi", "connected", "suspicious", "at-object", "at-place", "in-region",
     "holding", "hand-full", "object-in-place", "place-in-region",
+    "object-in-region",
     "visited-poi", "visited-place", "visited-object", "visited-region",
     "safe", "distance", "total-cost",
 }
