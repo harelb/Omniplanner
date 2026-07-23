@@ -17,6 +17,20 @@ FD_SEARCH_TIME_LIMIT = os.getenv("OMNIPLANNER_FD_SEARCH_TIME_LIMIT", "60")
 FD_TRANSLATE_TIME_LIMIT = os.getenv("OMNIPLANNER_FD_TRANSLATE_TIME_LIMIT", "60")
 
 
+def resolve_dump_dir():
+    """Directory where the debug domain/problem/plan PDDL dumps are written.
+
+    Defaults to ~/adt4_output/omniplanner/; override with the
+    OMNIPLANNER_DUMP_DIR env var. Created if it doesn't already exist.
+    """
+    dump_dir = os.environ.get("OMNIPLANNER_DUMP_DIR")
+    dump_dir = os.path.expanduser(dump_dir) if dump_dir else os.path.expanduser(
+        "~/adt4_output/omniplanner"
+    )
+    os.makedirs(dump_dir, exist_ok=True)
+    return dump_dir
+
+
 def solve_pddl(problem: GroundedPddlProblem):
     """Use fast-downward to solve the given pddl problem"""
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -24,17 +38,19 @@ def solve_pddl(problem: GroundedPddlProblem):
         key = str(uuid.uuid4())[:8]
         formatted_str = now.strftime("%Y-%m-%d_%H_%M_%S")
 
+        dump_dir = resolve_dump_dir()
+
         problem_fn = os.path.join(tmpdirname, "problem.pddl")
-        debug_problem_fn = os.path.expanduser(
-            f"~/omniplanner_problem_{formatted_str}_{key}.pddl"
+        debug_problem_fn = os.path.join(
+            dump_dir, f"omniplanner_problem_{formatted_str}_{key}.pddl"
         )
         domain_fn = os.path.join(tmpdirname, "domain.pddl")
-        debug_domain_fn = os.path.expanduser(
-            f"~/omniplanner_domain_{formatted_str}_{key}.pddl"
+        debug_domain_fn = os.path.join(
+            dump_dir, f"omniplanner_domain_{formatted_str}_{key}.pddl"
         )
         plan_fn = os.path.join(tmpdirname, "plan.txt")
-        debug_plan_fn = os.path.expanduser(
-            f"~/omniplanner_plan_{formatted_str}_{key}.pddl"
+        debug_plan_fn = os.path.join(
+            dump_dir, f"omniplanner_plan_{formatted_str}_{key}.pddl"
         )
 
         with open(problem_fn, "w") as fo:
