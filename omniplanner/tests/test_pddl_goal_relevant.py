@@ -302,19 +302,6 @@ def test_goal_relevant_object_in_region_plan_real_graph_shape():
     assert "place-object" in actions
 
 
-if __name__ == "__main__":
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS  {name}")
-            except Exception as e:
-                failures += 1
-                print(f"FAIL  {name}: {e!r}")
-    sys.exit(1 if failures else 0)
-
-
 def test_region_members_selected_nearest_region_centroid():
     """Task 9 (exploration gate 2): the representative places handed to FD
     for a region goal must be the ones nearest the REGION's centroid, not
@@ -342,3 +329,16 @@ def test_region_members_selected_nearest_region_centroid():
     )
     assert "(place-in-region p10 r1)" in problem
     assert "p9" not in problem
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS  {name}")
+            except Exception as e:
+                failures += 1
+                print(f"FAIL  {name}: {e!r}")
+    sys.exit(1 if failures else 0)
