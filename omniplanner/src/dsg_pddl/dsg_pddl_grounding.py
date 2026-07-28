@@ -492,6 +492,19 @@ def collect_goal_symbol_names(ast):
     return names
 
 
+def could_name_a_scene_symbol(token):
+    """Whether a token collected from a goal could name a scene-graph symbol.
+
+    ``collect_goal_symbol_names`` keeps every leaf that isn't a known operator,
+    type or predicate name, so it also hands back numeric literals (``100``,
+    ``0.5``) and arithmetic/comparison operators (``<``, ``>=``, ``*``) from
+    goals with metric constraints. PDDL names must start with a letter, so
+    anything else is definitionally not a symbol and must never be reported as
+    an unresolved one.
+    """
+    return bool(token) and token[0].isalpha()
+
+
 def get_places_layer(G):
     try:
         return G.get_layer(spark_dsg.DsgLayers.MESH_PLACES)
@@ -551,11 +564,25 @@ def generate_goal_relevant_pddl(
         )
         return G.get_node(ns).attributes.position[:2]
 
+    # Names already declared in the problem independently of the scene graph --
+    # i.e. the robot start place "pstart", which goes into (:objects) and
+    # (:init) below, so a goal like "(and (at-poi pstart))" ("return to start")
+    # is well-formed even though no scene symbol is named pstart. Snapshotted
+    # before the loop on purpose: every name added to `selected` inside the loop
+    # came from `by_name`, so checking membership live would be equivalent but
+    # order-dependent, and `referenced` is a set with nondeterministic order.
+    predeclared = frozenset(selected)
+
     missing = []
 
     for name in referenced:
         sym = by_name.get(name)
         if sym is None:
+            if name in predeclared or not could_name_a_scene_symbol(name):
+                # Declared regardless of the scene graph (pstart), or not a
+                # symbol at all (numeric literal / operator from a metric
+                # constraint): neither is a grounding failure.
+                continue
             # Do NOT skip: the name stays in the goal string, so Fast Downward
             # would die on the undeclared object (rc 31). Collect every
             # unresolved name and report them together below, so a caller can
