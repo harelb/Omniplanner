@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -71,6 +72,13 @@ def symbol_connectivity_to_pddl(connectivity):
     for info_s, info_t, dist in connectivity:
         s = info_s.symbol
         t = info_t.symbol
+        if not math.isfinite(dist):
+            # No path between the two symbols (disconnected components /
+            # unreachable placement): emit NO connectivity facts, so the
+            # planner grounds the pair as mutually unreachable and Fast
+            # Downward can prove unsolvability. int(inf) used to crash the
+            # whole grounding here, masking that legitimate verdict.
+            continue
         d = int(dist)
 
         connected = ("connected", s, t)
