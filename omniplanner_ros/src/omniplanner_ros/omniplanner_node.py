@@ -24,7 +24,11 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from robot_executor_interface_ros.action_descriptions_ros import to_msg, to_viz_msg
-from robot_executor_msgs.msg import ActionResultMsg, ActionSequenceMsg
+from robot_executor_msgs.msg import (
+    ActionResultMsg,
+    ActionSequenceMsg,
+    RuntimeGuardsMsg,
+)
 from robot_vocalizer.plan_vocalizer import PlanVocalizer
 from ros_system_monitor_msgs.msg import NodeInfoMsg
 from spark_config import Config, config_field, register_config
@@ -87,6 +91,34 @@ class PlannerConfig(Config):
     plugin: Any = config_field("omniplanner_pipeline", required=False)
 
 
+def evaluate_dispatch_guards(guards, guards_age_s, *, min_battery_percent=10.0,
+                             max_guard_age_s=10.0):
+    """The PR B8 dispatch gate, pure: (latest RuntimeGuardsMsg-like, its age)
+    -> (ok, typed_reason). Volatile platform state is checked at DISPATCH
+    time only — it is deliberately not planning state (skill contracts name
+    WHICH guards apply; this decides).
+
+    Fail-OPEN on missing/stale/unknown guards (with the reason string
+    returned as ``None`` for ok): a robot without a guard stream — e.g. a
+    non-spot adaptor, or a sim without battery state — must not be
+    unplannable. Fail-CLOSED only on an affirmative bad guard.
+    """
+    if guards is None:
+        return True, None
+    if guards_age_s is not None and guards_age_s > max_guard_age_s:
+        return True, None  # stale stream: no live evidence either way
+    if guards.estop_known and guards.estop_pressed:
+        return False, "estop_pressed"
+    if guards.power_known and not guards.powered_on:
+        return False, "not_powered"
+    if guards.battery_known and guards.battery_percent >= 0.0 \
+            and guards.battery_percent < min_battery_percent:
+        return False, f"battery_below_min({guards.battery_percent:.0f}%<{min_battery_percent:.0f}%)"
+    if guards.lease_known and not guards.lease_owned:
+        return False, "lease_not_owned"
+    return True, None
+
+
 class RobotPlanningAdaptor:
     def __init__(self, config, node=None, tf_buffer=None, qos_profile=None):
         self.tf_buffer = tf_buffer
@@ -119,6 +151,26 @@ class RobotPlanningAdaptor:
             10,
         )
 
+        # PR B8: latest runtime-guard snapshot + the dispatch gate's knobs.
+        self._node_clock = node.get_clock()
+        self.min_battery_percent = float(
+            getattr(config, "min_battery_percent", 10.0) or 10.0)
+        self.last_guards = None
+        self.last_guards_stamp_s = None
+        guards_topic = getattr(config, "runtime_guards_topic", "") or (
+            f"/{self.name}/spot_executor/runtime_guards"
+        )
+        self.runtime_guards_sub = node.create_subscription(
+            RuntimeGuardsMsg,
+            guards_topic,
+            self._on_runtime_guards,
+            1,
+        )
+
+    def _on_runtime_guards(self, msg):
+        self.last_guards = msg
+        self.last_guards_stamp_s = self._node_clock.now().nanoseconds / 1e9
+
     def _on_action_result(self, msg):
         self.ros_logger.info(
             f"[{self.name}] action result: plan={msg.plan_id!r} "
@@ -140,7 +192,21 @@ class RobotPlanningAdaptor:
             return None
 
     def publish_plan(self, plan):
+        """Dispatch a compiled plan, gated by the latest runtime guards
+        (PR B8). Returns (published: bool, refusal_reason: str | None)."""
+        age_s = None
+        if self.last_guards_stamp_s is not None:
+            age_s = self._node_clock.now().nanoseconds / 1e9 - self.last_guards_stamp_s
+        ok, reason = evaluate_dispatch_guards(
+            self.last_guards, age_s,
+            min_battery_percent=self.min_battery_percent)
+        if not ok:
+            self.ros_logger.error(
+                f"[{self.name}] dispatch REFUSED by runtime guard: {reason}"
+            )
+            return False, reason
         self.plan_pub.publish(plan)
+        return True, None
 
 
 @register_config(
@@ -154,6 +220,10 @@ class RobotConfig(Config):
     # PR B5: where this robot's executor publishes ActionResultMsg. Empty ->
     # the spot_executor convention /<robot_name>/spot_executor/action_result.
     action_result_topic: str = ""
+    # PR B8: the executor's RuntimeGuardsMsg topic (same empty-default
+    # convention) and the dispatch gate's battery floor.
+    runtime_guards_topic: str = ""
+    min_battery_percent: float = 10.0
 
 
 class PhoenixPlanningAdaptor(RobotPlanningAdaptor):
