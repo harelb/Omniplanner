@@ -24,7 +24,7 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from robot_executor_interface_ros.action_descriptions_ros import to_msg, to_viz_msg
-from robot_executor_msgs.msg import ActionSequenceMsg
+from robot_executor_msgs.msg import ActionResultMsg, ActionSequenceMsg
 from robot_vocalizer.plan_vocalizer import PlanVocalizer
 from ros_system_monitor_msgs.msg import NodeInfoMsg
 from spark_config import Config, config_field, register_config
@@ -101,6 +101,32 @@ class RobotPlanningAdaptor:
             qos_profile or 1,
         )
 
+        # Executor -> planner return channel (PR B5): per-action results from
+        # the robot's executor node. Until this subscription existed there was
+        # NO feedback path from execution back to planning (heartbeats only).
+        # ``action_results`` keeps the received results keyed by plan_id, in
+        # arrival order, for planner-side consumers (e.g. the acquisition
+        # loop's obligation resolution); the log line is the minimal liveness
+        # signal the B5 acceptance looks for.
+        self.action_results = {}
+        result_topic = getattr(config, "action_result_topic", "") or (
+            f"/{self.name}/spot_executor/action_result"
+        )
+        self.action_result_sub = node.create_subscription(
+            ActionResultMsg,
+            result_topic,
+            self._on_action_result,
+            10,
+        )
+
+    def _on_action_result(self, msg):
+        self.ros_logger.info(
+            f"[{self.name}] action result: plan={msg.plan_id!r} "
+            f"#{msg.action_index} {msg.action_type} -> {msg.status}"
+            + (f" ({msg.detail})" if msg.detail else "")
+        )
+        self.action_results.setdefault(msg.plan_id, []).append(msg)
+
     def get_pose(self, parent_frame, timeout_s: float = 1.0):
         self.ros_logger.info(
             f"Looking up pose for {self.name} ({parent_frame}->{self.child_frame})"
@@ -125,6 +151,9 @@ class RobotConfig(Config):
     robot_name: str = ""
     robot_type: str = ""
     body_frame: str = ""
+    # PR B5: where this robot's executor publishes ActionResultMsg. Empty ->
+    # the spot_executor convention /<robot_name>/spot_executor/action_result.
+    action_result_topic: str = ""
 
 
 class PhoenixPlanningAdaptor(RobotPlanningAdaptor):
