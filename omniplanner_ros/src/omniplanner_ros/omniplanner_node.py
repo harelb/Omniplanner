@@ -470,7 +470,7 @@ class OmniPlannerRos(Node):
                 self.get_logger().error("Got plan request, but no DSG!")
                 return
 
-            with self.current_planner_lock and self.plan_time_start_lock:
+            with self.current_planner_lock, self.plan_time_start_lock:
                 self.current_planner = name
                 self.plan_time_start = time.time()
 
@@ -492,24 +492,45 @@ class OmniPlannerRos(Node):
                     self.robot_adaptors, self.dsg_frame, plans
                 )
                 plan_dict = collect_plans(compiled_plans)
+                # publish_plan is gated by the runtime guards (PR B8) and
+                # returns (published, refusal_reason). A refused plan was NOT
+                # sent to the executor, so it must not be visualized, must not
+                # reach the on_plan_compiled hook, and must not be reported as
+                # published.
+                published_dict = {}
                 for robot_name, compiled_plan in plan_dict.items():
-                    self.robot_adaptors[robot_name].publish_plan(
-                        to_msg(compiled_plan)
-                    )
+                    published, refusal_reason = self.robot_adaptors[
+                        robot_name
+                    ].publish_plan(to_msg(compiled_plan))
+                    if not published:
+                        self.get_logger().warning(
+                            f"Plan for robot {robot_name} (plugin {name}) was "
+                            f"NOT published: {refusal_reason}"
+                        )
+                        continue
+                    published_dict[robot_name] = compiled_plan
                     # TODO: combine markers into single array so that latching
                     # works correctly for multi-robot plans?
                     self.compiled_plan_viz_pub.publish(
                         to_viz_msg(compiled_plan, robot_name)
                     )
 
+                if not published_dict:
+                    self.get_logger().warning(
+                        f"No plan published for plugin {name}; every compiled "
+                        "plan was refused by the runtime dispatch guards."
+                    )
+                    return
+
                 # Plugin extension point: let the plugin react to a freshly
                 # compiled plan (e.g. to publish derived information such as the
                 # set of POIs visited by the new plan). Optional; plugins that
-                # don't define this method are unaffected.
+                # don't define this method are unaffected. Only plans that were
+                # actually dispatched are handed to the hook.
                 on_plan_compiled = getattr(plugin, "on_plan_compiled", None)
                 if on_plan_compiled is not None:
                     try:
-                        on_plan_compiled(plans, plan_dict)
+                        on_plan_compiled(plans, published_dict)
                     except Exception as exc:
                         self.get_logger().warning(
                             f"on_plan_compiled hook for plugin {name} raised: {exc}"
@@ -533,7 +554,7 @@ class OmniPlannerRos(Node):
                 # Always clear the in-flight planner state so the heartbeat
                 # reports "Ready to plan!" and the next request is accepted,
                 # whether the solve succeeded or raised.
-                with self.current_planner_lock and self.plan_time_start_lock:
+                with self.current_planner_lock, self.plan_time_start_lock:
                     self.current_planner = None
                     self.plan_time_start = None
 
