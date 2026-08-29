@@ -18,6 +18,7 @@ Every type derives from ``Exception`` (not ``BaseException``), so the blanket
 continuing exactly as before; callers that care can catch the specific type.
 """
 
+import pickle
 from dataclasses import dataclass
 
 __all__ = [
@@ -40,6 +41,15 @@ class MissingSymbol:
 
 
 class GroundingError(Exception): ...
+
+
+def _is_picklable(value) -> bool:
+    try:
+        pickle.dumps(value)
+    except Exception:
+        return False
+    return True
+
 
 
 class MissingSymbolError(GroundingError):
@@ -90,23 +100,62 @@ class MissingSymbolError(GroundingError):
         self.original = original
         self.goal = goal
 
-        singular = symbol is not None or pddl_symbol is not None
         if missing is None:
             name = pddl_symbol if pddl_symbol is not None else str(symbol)
             missing = [MissingSymbol(name, kind_hint_for_symbol(name or ""))]
         self.missing = missing
 
-        if singular:
-            message = (
-                f"Could not find node {symbol} in DSG "
-                f"(pddl symbol '{pddl_symbol}')"
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        if self.symbol is not None or self.pddl_symbol is not None:
+            return (
+                f"Could not find node {self.symbol} in DSG "
+                f"(pddl symbol '{self.pddl_symbol}')"
             )
-        else:
-            message = (
-                "goal references symbols absent from the scene graph: "
-                f"{[m.name for m in missing]}"
-            )
-        super().__init__(message)
+        return (
+            "goal references symbols absent from the scene graph: "
+            f"{[m.name for m in self.missing]}"
+        )
+
+    def __reduce__(self):
+        """Make the error picklable / copyable.
+
+        ``BaseException.__reduce__`` returns ``(cls, self.args)``, and
+        ``self.args`` is the *message string* -- which this ``__init__`` would
+        then take as ``missing``, a list of ``MissingSymbol``. Unpickling blew
+        up with ``AttributeError: 'str' object has no attribute 'name'``, so
+        anything that copies or ships an error (multiprocessing, a plan cache,
+        ``copy.deepcopy`` of a result record) crashed on the failure path.
+        Rebuild from the plural form and restore the keyword-only singular
+        fields from ``__dict__``.
+
+        ``symbol`` is usually a ``spark_dsg.NodeSymbol``, a pybind object with
+        no pickle support at all, so it is degraded to ``str(symbol)`` when it
+        cannot be pickled -- the message, ``missing``, and every downstream
+        string match survive, which is what callers of a *failure* object
+        actually need. ``__copy__`` below keeps the live object for the
+        in-process case.
+        """
+        state = dict(self.__dict__)
+        symbol = state.get("symbol")
+        if symbol is not None and not _is_picklable(symbol):
+            state["symbol"] = str(symbol)
+        return (self.__class__, (self.missing, self.goal), state)
+
+    def __copy__(self):
+        """Shallow copy, keeping the live ``symbol`` object (which pickle has
+        to degrade to a string -- see ``__reduce__``)."""
+        clone = self.__class__(self.missing, self.goal)
+        clone.__setstate__(dict(self.__dict__))
+        return clone
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # `args` (and therefore str()) lives in BaseException's own storage,
+        # not in __dict__, so restoring the state alone would leave a singular
+        # error wearing the plural form's message. Re-derive it.
+        self.args = (self._message(),)
 
 
 class PddlSolverError(Exception):
