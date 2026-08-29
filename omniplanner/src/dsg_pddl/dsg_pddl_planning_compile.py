@@ -1,19 +1,31 @@
 """Non-ROS PDDL plan compilation. Mirrors omniplanner_ros.pddl_planner_ros.compile_pddl_plan
 but without rclpy dependency, so the kinematic simulator can run standalone."""
 
-from typing import Any
+from __future__ import annotations
 
 import numpy as np
 from omniplanner.omniplanner import SymbolicContext
-from robot_executor_interface.action_descriptions import (
-    ActionSequence,
-    Follow,
-    Gaze,
-    Pick,
-    Place,
-)
 
 from dsg_pddl.dsg_pddl_planning import PddlPlan
+
+# robot_executor_interface lives in spot_tools, which is a colcon package and is
+# not necessarily on the path of a plain (non-ROS) virtualenv. Import it
+# defensively so this module -- and the pure helpers below -- stay importable
+# for unit testing; compile_pddl_plan_pure re-raises with a clear message if it
+# is actually called without the action descriptions available.
+try:
+    from robot_executor_interface.action_descriptions import (
+        ActionSequence,
+        Follow,
+        Gaze,
+        Pick,
+        Place,
+    )
+
+    ACTION_DESCRIPTIONS_IMPORT_ERROR = None
+except ImportError as e:  # pragma: no cover - depends on the environment
+    ActionSequence = Follow = Gaze = Pick = Place = None
+    ACTION_DESCRIPTIONS_IMPORT_ERROR = e
 
 
 def ensure_3d(pt):
@@ -26,11 +38,30 @@ def ensure_3d(pt):
     return pt
 
 
+def _object_class(context, symbol) -> str:
+    """The semantic label for ``symbol`` in the plan's symbolic context, or "".
+
+    Pure (no ROS / no action descriptions) so it is unit-testable on its own.
+
+    Both ``pick-object`` and ``place-object`` need this. It used to be computed
+    *only* inside the ``pick-object`` branch and then read by ``place-object``,
+    which is wrong twice over: a plan that places without a preceding pick hit
+    an ``UnboundLocalError``, and a plan that picks A then places B stamped B's
+    ``Place`` with A's class. Looking it up per action fixes both.
+    """
+    if context is None or symbol not in context:
+        return ""
+    attrs = context[symbol]
+    if attrs is None or "semantic_label" not in attrs:
+        return ""
+    return attrs["semantic_label"]
+
+
 def compile_pddl_plan_pure(
     contextualized_plan: SymbolicContext[PddlPlan],
     plan_id: str,
     robot_name: str,
-    frame_id: str
+    frame_id: str,
 ) -> ActionSequence:
     """Compile a PDDL plan to an ActionSequence without ROS dependencies.
 
@@ -44,8 +75,16 @@ def compile_pddl_plan_pure(
         ActionSequence with compiled actions
 
     Raises:
+        ImportError: If robot_executor_interface is not importable
         NotImplementedError: For unsupported action types
     """
+    if ActionSequence is None:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "robot_executor_interface.action_descriptions is not importable, so "
+            "PDDL plans cannot be compiled to an ActionSequence. Source the "
+            "colcon workspace (spot_tools) first."
+        ) from ACTION_DESCRIPTIONS_IMPORT_ERROR
+
     plan = contextualized_plan.value
     context = contextualized_plan.context
     actions = []
@@ -68,15 +107,10 @@ def compile_pddl_plan_pure(
                 )
             case "pick-object":
                 robot_point, pick_point = parameters
-                object_class = ""
-                if symbolic_action[1] in context:
-                    attrs = context[symbolic_action[1]]
-                    if "semantic_label" in attrs:
-                        object_class = attrs["semantic_label"]
                 actions.append(
                     Pick(
                         frame=frame_id,
-                        object_class=object_class,
+                        object_class=_object_class(context, symbolic_action[1]),
                         robot_point=ensure_3d(robot_point),
                         object_point=ensure_3d(pick_point),
                         object_id=symbolic_action[1],
@@ -87,7 +121,7 @@ def compile_pddl_plan_pure(
                 actions.append(
                     Place(
                         frame=frame_id,
-                        object_class=object_class,
+                        object_class=_object_class(context, symbolic_action[1]),
                         robot_point=ensure_3d(robot_point),
                         object_point=ensure_3d(place_point),
                         object_id=symbolic_action[1],
