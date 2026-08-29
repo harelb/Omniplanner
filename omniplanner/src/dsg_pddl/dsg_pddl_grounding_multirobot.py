@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from collections.abc import Mapping
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -279,7 +280,7 @@ def generate_multirobot_region_pddl(
 def ground_problem(
     domain: MultiRobotPddlDomain,
     dsg: spark_dsg.DynamicSceneGraph,
-    robot_states: dict,
+    robot_states: Mapping,
     goal: PddlGoal,
     feedback: Any = None,
 ) -> MultiRobotWrapper[GroundedPddlProblem]:

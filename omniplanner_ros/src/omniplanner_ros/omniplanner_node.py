@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -23,7 +24,11 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from robot_executor_interface_ros.action_descriptions_ros import to_msg, to_viz_msg
-from robot_executor_msgs.msg import ActionSequenceMsg
+from robot_executor_msgs.msg import (
+    ActionResultMsg,
+    ActionSequenceMsg,
+    RuntimeGuardsMsg,
+)
 from robot_vocalizer.plan_vocalizer import PlanVocalizer
 from ros_system_monitor_msgs.msg import NodeInfoMsg
 from spark_config import Config, config_field, register_config
@@ -86,6 +91,34 @@ class PlannerConfig(Config):
     plugin: Any = config_field("omniplanner_pipeline", required=False)
 
 
+def evaluate_dispatch_guards(guards, guards_age_s, *, min_battery_percent=10.0,
+                             max_guard_age_s=10.0):
+    """The PR B8 dispatch gate, pure: (latest RuntimeGuardsMsg-like, its age)
+    -> (ok, typed_reason). Volatile platform state is checked at DISPATCH
+    time only — it is deliberately not planning state (skill contracts name
+    WHICH guards apply; this decides).
+
+    Fail-OPEN on missing/stale/unknown guards (with the reason string
+    returned as ``None`` for ok): a robot without a guard stream — e.g. a
+    non-spot adaptor, or a sim without battery state — must not be
+    unplannable. Fail-CLOSED only on an affirmative bad guard.
+    """
+    if guards is None:
+        return True, None
+    if guards_age_s is not None and guards_age_s > max_guard_age_s:
+        return True, None  # stale stream: no live evidence either way
+    if guards.estop_known and guards.estop_pressed:
+        return False, "estop_pressed"
+    if guards.power_known and not guards.powered_on:
+        return False, "not_powered"
+    if guards.battery_known and guards.battery_percent >= 0.0 \
+            and guards.battery_percent < min_battery_percent:
+        return False, f"battery_below_min({guards.battery_percent:.0f}%<{min_battery_percent:.0f}%)"
+    if guards.lease_known and not guards.lease_owned:
+        return False, "lease_not_owned"
+    return True, None
+
+
 class RobotPlanningAdaptor:
     def __init__(self, config, node=None, tf_buffer=None, qos_profile=None):
         self.tf_buffer = tf_buffer
@@ -100,18 +133,80 @@ class RobotPlanningAdaptor:
             qos_profile or 1,
         )
 
-    def get_pose(self, parent_frame):
+        # Executor -> planner return channel (PR B5): per-action results from
+        # the robot's executor node. Until this subscription existed there was
+        # NO feedback path from execution back to planning (heartbeats only).
+        # ``action_results`` keeps the received results keyed by plan_id, in
+        # arrival order, for planner-side consumers (e.g. the acquisition
+        # loop's obligation resolution); the log line is the minimal liveness
+        # signal the B5 acceptance looks for.
+        self.action_results = {}
+        result_topic = getattr(config, "action_result_topic", "") or (
+            f"/{self.name}/spot_executor/action_result"
+        )
+        self.action_result_sub = node.create_subscription(
+            ActionResultMsg,
+            result_topic,
+            self._on_action_result,
+            10,
+        )
+
+        # PR B8: latest runtime-guard snapshot + the dispatch gate's knobs.
+        self._node_clock = node.get_clock()
+        self.min_battery_percent = float(
+            getattr(config, "min_battery_percent", 10.0) or 10.0)
+        self.last_guards = None
+        self.last_guards_stamp_s = None
+        guards_topic = getattr(config, "runtime_guards_topic", "") or (
+            f"/{self.name}/spot_executor/runtime_guards"
+        )
+        self.runtime_guards_sub = node.create_subscription(
+            RuntimeGuardsMsg,
+            guards_topic,
+            self._on_runtime_guards,
+            1,
+        )
+
+    def _on_runtime_guards(self, msg):
+        self.last_guards = msg
+        self.last_guards_stamp_s = self._node_clock.now().nanoseconds / 1e9
+
+    def _on_action_result(self, msg):
+        self.ros_logger.info(
+            f"[{self.name}] action result: plan={msg.plan_id!r} "
+            f"#{msg.action_index} {msg.action_type} -> {msg.status}"
+            + (f" ({msg.detail})" if msg.detail else "")
+        )
+        self.action_results.setdefault(msg.plan_id, []).append(msg)
+
+    def get_pose(self, parent_frame, timeout_s: float = 1.0):
         self.ros_logger.info(
             f"Looking up pose for {self.name} ({parent_frame}->{self.child_frame})"
         )
         try:
-            return get_robot_pose(self.tf_buffer, parent_frame, self.child_frame)
+            return get_robot_pose(
+                self.tf_buffer, parent_frame, self.child_frame, timeout_s
+            )
         except tf2_ros.TransformException as e:
             self.ros_logger.warning(str(e))
             return None
 
     def publish_plan(self, plan):
+        """Dispatch a compiled plan, gated by the latest runtime guards
+        (PR B8). Returns (published: bool, refusal_reason: str | None)."""
+        age_s = None
+        if self.last_guards_stamp_s is not None:
+            age_s = self._node_clock.now().nanoseconds / 1e9 - self.last_guards_stamp_s
+        ok, reason = evaluate_dispatch_guards(
+            self.last_guards, age_s,
+            min_battery_percent=self.min_battery_percent)
+        if not ok:
+            self.ros_logger.error(
+                f"[{self.name}] dispatch REFUSED by runtime guard: {reason}"
+            )
+            return False, reason
         self.plan_pub.publish(plan)
+        return True, None
 
 
 @register_config(
@@ -122,6 +217,13 @@ class RobotConfig(Config):
     robot_name: str = ""
     robot_type: str = ""
     body_frame: str = ""
+    # PR B5: where this robot's executor publishes ActionResultMsg. Empty ->
+    # the spot_executor convention /<robot_name>/spot_executor/action_result.
+    action_result_topic: str = ""
+    # PR B8: the executor's RuntimeGuardsMsg topic (same empty-default
+    # convention) and the dispatch gate's battery floor.
+    runtime_guards_topic: str = ""
+    min_battery_percent: float = 10.0
 
 
 class PhoenixPlanningAdaptor(RobotPlanningAdaptor):
@@ -142,25 +244,36 @@ class PhoenixRobotConfig(RobotConfig):
 class OmniplannerNodeConfig(Config):
     robots: List[config_field("robot_adaptor")] = field(default_factory=list)
     planners: Dict[str, PlannerConfig] = field(default_factory=dict)
+    # How long (s) to wait for a robot's transform before treating it as
+    # unavailable. Small so offline robots don't stall planning; online robots
+    # resolve immediately regardless. See get_robot_pose.
+    tf_timeout_s: float = 0.2
 
     @classmethod
     def load(cls, path: str):
         return Config.load(OmniplannerNodeConfig, path)
 
 
-def get_robot_pose(tf_buffer, parent_frame: str, child_frame: str) -> np.ndarray:
+def get_robot_pose(
+    tf_buffer, parent_frame: str, child_frame: str, timeout_s: float = 1.0
+) -> np.ndarray:
     """
     Looks up the transform from parent_frame to child_frame and returns [x, y, z, yaw].
 
+    ``timeout_s`` is how long to wait for the transform to become available. For
+    an online robot publishing TF continuously, the transform is already in the
+    buffer and this returns immediately regardless of the timeout; the timeout is
+    only spent waiting on an *absent* transform (e.g. an offline robot), so a
+    small value keeps planning responsive when robots are offline.
     """
-    # TODO: use Time(0) instead of now?
+    # Time() is time 0, i.e. "latest available" in tf2.
     try:
         now = rclpy.time.Time()
         tf_buffer.can_transform(
             parent_frame,
             child_frame,
             now,
-            timeout=rclpy.duration.Duration(seconds=1.0),
+            timeout=rclpy.duration.Duration(seconds=timeout_s),
         )
         transform = tf_buffer.lookup_transform(parent_frame, child_frame, now)
 
@@ -176,6 +289,44 @@ def get_robot_pose(tf_buffer, parent_frame: str, child_frame: str) -> np.ndarray
     except tf2_ros.TransformException as e:
         print(f"Transform error: {e}")
         raise
+
+
+class LazyRobotPoses(Mapping):
+    """Robot poses looked up from TF on demand and cached.
+
+    Behaves like the eager ``{robot_name: pose_or_None}`` dict it replaces
+    (iteration yields every configured robot; offline robots resolve to None),
+    but a robot's transform is only looked up the first time it is accessed.
+    Single-robot planning therefore touches exactly one robot, so the per-offline
+    -robot TF timeout is not paid for robots that have no goal assigned. The
+    multi-robot grounders that iterate every robot still resolve them all, with
+    offline robots filtered out downstream via ``pose is not None`` as before.
+    """
+
+    def __init__(self, robot_adaptors, parent_frame, timeout_s=1.0):
+        self._adaptors = robot_adaptors
+        self._parent_frame = parent_frame
+        self._timeout_s = timeout_s
+        self._cache = {}
+
+    def __getitem__(self, name):
+        if name not in self._adaptors:
+            raise KeyError(name)
+        if name not in self._cache:
+            self._cache[name] = self._adaptors[name].get_pose(
+                self._parent_frame, self._timeout_s
+            )
+        return self._cache[name]
+
+    def __iter__(self):
+        return iter(self._adaptors)
+
+    def __len__(self):
+        return len(self._adaptors)
+
+    def resolved(self):
+        """Poses actually looked up so far (for logging without forcing lookups)."""
+        return dict(self._cache)
 
 
 class OmniPlannerRos(Node):
@@ -298,10 +449,11 @@ class OmniPlannerRos(Node):
         self.heartbeat_pub.publish(msg)
 
     def get_robot_poses(self, dsg_frame):
-        pose_dict = {}
-        for name, pose_adaptor in self.robot_adaptors.items():
-            pose_dict[name] = pose_adaptor.get_pose(dsg_frame)
-        return pose_dict
+        # Lazy: only robots whose pose is actually accessed during grounding get
+        # a TF lookup, so robots without an assigned goal cost nothing.
+        return LazyRobotPoses(
+            self.robot_adaptors, dsg_frame, timeout_s=self.config.tf_timeout_s
+        )
 
     def register_plugin(self, name, plugin):
         self.get_logger().info(f"Registering subscription plugin {name}")
@@ -321,14 +473,18 @@ class OmniPlannerRos(Node):
                 self.current_planner = name
                 self.plan_time_start = time.time()
 
+            # Poses are resolved lazily; avoid formatting the whole mapping here
+            # (that would force a TF lookup for every configured robot).
             robot_poses = self.get_robot_poses(self.dsg_frame)
-            self.get_logger().info(f"Planning with robot poses {robot_poses}")
 
             plan_request = callback(msg, robot_poses)
             with self.dsg_lock:
                 plans = full_planning_pipeline(
                     plan_request, self.dsg_last, self.feedback
                 )
+            self.get_logger().info(
+                f"Planned using robot poses {robot_poses.resolved()}"
+            )
 
             compiled_plans = compile_plan(self.robot_adaptors, self.dsg_frame, plans)
             plan_dict = collect_plans(compiled_plans)
