@@ -11,6 +11,7 @@ import dsg_pddl.domains
 import numpy as np
 import spark_config as sc
 from dsg_pddl.dsg_pddl_planning import PddlPlan
+from dsg_pddl.dsg_pddl_planning_compile import _object_class
 from dsg_pddl.pddl_grounding import PddlDomain, PddlGoal
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -168,15 +169,10 @@ def compile_pddl_plan(
                 )
             case "pick-object":
                 robot_point, pick_point = parameters
-                object_class = ""
-                if symbolic_action[1] in context:
-                    attrs = context[symbolic_action[1]]
-                    if "semantic_label" in attrs:
-                        object_class = attrs["semantic_label"]
                 actions.append(
                     Pick(
                         frame=frame_id,
-                        object_class=object_class,
+                        object_class=_object_class(context, symbolic_action[1]),
                         robot_point=ensure_3d(robot_point),
                         object_point=ensure_3d(pick_point),
                         object_id=symbolic_action[1],
@@ -187,7 +183,7 @@ def compile_pddl_plan(
                 actions.append(
                     Place(
                         frame=frame_id,
-                        object_class=object_class,
+                        object_class=_object_class(context, symbolic_action[1]),
                         robot_point=ensure_3d(robot_point),
                         object_point=ensure_3d(place_point),
                         object_id=symbolic_action[1],
