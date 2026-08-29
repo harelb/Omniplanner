@@ -1,5 +1,4 @@
 import logging
-import math
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -8,6 +7,11 @@ import numpy as np
 import spark_dsg
 from plum import dispatch
 
+from dsg_pddl.grounding_errors import (
+    MissingSymbol,
+    MissingSymbolError,
+    kind_hint_for_symbol,
+)
 from dsg_pddl.pddl_grounding import (
     GroundedPddlProblem,
     PddlDomain,
@@ -34,21 +38,6 @@ DEFAULT_SCENE_SCOPE = os.getenv("OMNIPLANNER_SCENE_SCOPE", "goal_relevant")
 GOAL_RELEVANT_MAX_REGION_PLACES = int(
     os.getenv("OMNIPLANNER_MAX_REGION_PLACES", "3")
 )
-
-
-class MissingSymbolError(Exception):
-    """Raised when a PDDL symbol cannot be grounded against the DSG.
-
-    Way 1 of the agentic open-set pipeline catches this to know which symbol
-    the agent must discover (or create) before grounding can succeed.
-    """
-    def __init__(self, symbol, pddl_symbol: str, dsg_char: str, index: int, original: Exception | None = None):
-        self.symbol = symbol            # spark_dsg.NodeSymbol
-        self.pddl_symbol = pddl_symbol  # e.g. "o3"
-        self.dsg_char = dsg_char        # e.g. "O"
-        self.index = index              # e.g. 3
-        self.original = original
-        super().__init__(f"Could not find node {symbol} in DSG (pddl symbol '{pddl_symbol}')")
 
 
 def generate_symbol_connectivity(G, symbols):
@@ -84,12 +73,18 @@ def symbol_connectivity_to_pddl(connectivity):
     for info_s, info_t, dist in connectivity:
         s = info_s.symbol
         t = info_t.symbol
-        if not math.isfinite(dist):
-            # No path between the two symbols (disconnected components /
-            # unreachable placement): emit NO connectivity facts, so the
-            # planner grounds the pair as mutually unreachable and Fast
-            # Downward can prove unsolvability. int(inf) used to crash the
-            # whole grounding here, masking that legitimate verdict.
+        # A disconnected pair (no path in the place graph) comes back as inf
+        # from LayerPlanner.get_external_distance. Emit NO connectivity facts
+        # for it: a fabricated connected/distance fact would both crash
+        # int(inf) (OverflowError, which used to kill the whole grounding) and
+        # lie about reachability. Skipping leaves the POI reachable via any
+        # other finite connection, and a truly isolated POI correctly
+        # unreachable -- so Fast Downward can prove unsolvability, the verdict
+        # the crash was masking.
+        if not np.isfinite(dist):
+            logger.warning(
+                "Skipping disconnected POI pair %s <-> %s (inf distance)", s, t
+            )
             continue
         d = int(dist)
 
@@ -297,26 +292,99 @@ def generate_object_containment(G):
 
 
 def generate_place_containment(G):
+    """Build ('place-in-region', place_sym, room_sym) facts.
+
+    Every other place-symbol source in this module (get_places_layer,
+    extract_all_symbols, object_current_place, the distance LayerPlanner, ...)
+    is keyed off MESH_PLACES ("P"). To keep place-in-region facts consistent
+    with those, this walks the real-graph shape first and only falls back to
+    a second shape if that yields nothing:
+
+      (a) MESH_PLACES nodes parented directly under ROOMS. This is the real
+          hydra/camp-graph shape: the region_injector adds room->MESH_PLACES
+          membership, and the 3D PLACES layer may be empty entirely. This is
+          also the original (pre object-in-region-derived-predicate) behavior
+          of this function.
+      (b) ROOMS nodes whose children resolve to place-type nodes (3D PLACES
+          or MESH_PLACES). This covers scene graphs (e.g. the synthetic test
+          fixture in examples/utils.py:build_test_dsg) where MESH_PLACES is
+          registered as a non-primary/orthogonal layer partition (e.g. layer
+          id 20, above ROOMS at layer id 4) that can never acquire a graph
+          parent via insert_edge -- node.parents() stays empty regardless of
+          which edges are inserted -- so those fixtures instead parent rooms
+          directly over the 3D PLACES layer.
+
+    (b) is run ONLY IF (a) produced zero facts -- it is a fallback, not a
+    union. On real hydra maps, rooms parent 3D PLACES nodes *in addition to*
+    MESH_PLACES nodes, and normalize_symbol's case-collapsing ("p<i>"/"P<i>"
+    collide, since both layers number from 0) means path (b)'s 3D-place-keyed
+    facts alias unrelated MESH_PLACES symbols whenever the two layers share an
+    index -- corrupting place-in-region truth values for downstream full-scope
+    and multirobot consumers. Falling back only when (a) is empty preserves
+    the toy fixture (whose MESH_PLACES layer never has parents, so (a) is
+    always empty there) while restoring exact pre-change behavior -- (a) only
+    -- on real graphs.
+    """
     try:
         places_layer_2d = G.get_layer(spark_dsg.DsgLayers.MESH_PLACES)
     except Exception:
-        places_layer_2d = G.get_layer(20)
+        try:
+            places_layer_2d = G.get_layer(20)
+        except Exception:
+            places_layer_2d = None
 
-    containments = []
+    # (a) MESH_PLACES nodes' parents -- the real-graph shape.
+    containments_a = set()
+    if places_layer_2d is not None:
+        for node in places_layer_2d.nodes:
+            for parent in node.parents():
+                if parent is not None:
+                    containments_a.add(
+                        (
+                            "place-in-region",
+                            normalize_symbol(node.id.str(True)),
+                            normalize_symbol(spark_dsg.NodeSymbol(parent).str(True)),
+                        )
+                    )
 
-    for node in places_layer_2d.nodes:
-        parents = node.parents()
-        for parent in parents:
-            if parent is not None:
-                containments.append(
+    if containments_a:
+        return sorted(containments_a)
+
+    try:
+        places_layer_3d = G.get_layer(spark_dsg.DsgLayers.PLACES)
+    except Exception:
+        places_layer_3d = None
+
+    place_node_ids = set()
+    if places_layer_2d is not None:
+        place_node_ids.update(node.id.value for node in places_layer_2d.nodes)
+    if places_layer_3d is not None:
+        place_node_ids.update(node.id.value for node in places_layer_3d.nodes)
+
+    try:
+        rooms_layer = G.get_layer(spark_dsg.DsgLayers.ROOMS)
+    except Exception:
+        rooms_layer = None
+
+    # (b) ROOMS nodes' children that are place-type nodes -- fallback only,
+    # for the toy-fixture shape (rooms parent the 3D PLACES layer instead of
+    # MESH_PLACES).
+    containments_b = set()
+    if rooms_layer is not None:
+        for room_node in rooms_layer.nodes:
+            room_sym = normalize_symbol(room_node.id.str(True))
+            for child in room_node.children():
+                if child not in place_node_ids:
+                    continue
+                containments_b.add(
                     (
                         "place-in-region",
-                        normalize_symbol(node.id.str(True)),
-                        normalize_symbol(spark_dsg.NodeSymbol(parent).str(True)),
+                        normalize_symbol(spark_dsg.NodeSymbol(child).str(True)),
+                        room_sym,
                     )
                 )
 
-    return containments
+    return sorted(containments_b)
 
 
 def generate_dense_init(G, symbols_of_interest, start_symbol):
@@ -386,9 +454,20 @@ def add_symbol_positions(G, symbols):
             node = G.get_node(ns)
             position = node.attributes.position[:2]
         except Exception as e:
-            raise MissingSymbolError(ns, s.symbol, dsg_symbol_char, index, original=e) from e
+            raise MissingSymbolError(
+                symbol=ns,
+                pddl_symbol=s.symbol,
+                dsg_char=dsg_symbol_char,
+                index=index,
+                original=e,
+            ) from e
         if position is None:
-            raise MissingSymbolError(ns, s.symbol, dsg_symbol_char, index)
+            raise MissingSymbolError(
+                symbol=ns,
+                pddl_symbol=s.symbol,
+                dsg_char=dsg_symbol_char,
+                index=index,
+            )
         s.position = position
     return symbols
 
@@ -426,6 +505,7 @@ _NON_SYMBOL_TOKENS = {
     "region", "place", "dsg_object", "point-of-interest", "object",
     "at-poi", "connected", "suspicious", "at-object", "at-place", "in-region",
     "holding", "hand-full", "object-in-place", "place-in-region",
+    "object-in-region",
     "visited-poi", "visited-place", "visited-object", "visited-region",
     "safe", "distance", "total-cost",
 }
@@ -453,6 +533,19 @@ def collect_goal_symbol_names(ast):
 
     walk(ast)
     return names
+
+
+def could_name_a_scene_symbol(token):
+    """Whether a token collected from a goal could name a scene-graph symbol.
+
+    ``collect_goal_symbol_names`` keeps every leaf that isn't a known operator,
+    type or predicate name, so it also hands back numeric literals (``100``,
+    ``0.5``) and arithmetic/comparison operators (``<``, ``>=``, ``*``) from
+    goals with metric constraints. PDDL names must start with a letter, so
+    anything else is definitionally not a symbol and must never be reported as
+    an unresolved one.
+    """
+    return bool(token) and token[0].isalpha()
 
 
 def get_places_layer(G):
@@ -488,11 +581,25 @@ def generate_goal_relevant_pddl(
     normalize_symbols(all_symbols)
     by_name = {s.symbol: s for s in all_symbols}
 
-    # Cache place symbol/position arrays for nearest-place lookups.
+    # One LayerPlanner over the full places graph, then restricted so that
+    # every nearest-place snap lands in the component reachable from the
+    # robot start: saved DSGs contain island place components, and snapping
+    # an object (or the distance matrix's anchors) to one silently drops its
+    # connectivity facts below -- a disconnected, unsolvable problem for a
+    # physically reachable goal (motion-tier v1, floor3 s71 NL).
+    layer_planner = LayerPlanner(
+        G, spark_dsg.DsgLayers.MESH_PLACES
+    ).restricted_to_component(np.asarray(initial_position))
+    reachable_place_values = set(layer_planner.node_ids)
+
+    # Cache place symbol/position arrays for nearest-place lookups, limited
+    # to the same reachable component the planner snaps to.
     places_layer = get_places_layer(G)
     place_syms = []
     place_pos = []
     for node in places_layer.nodes:
+        if node.id.value not in reachable_place_values:
+            continue
         place_syms.append(normalize_symbol(node.id.str(True)))
         place_pos.append(node.attributes.position[:2])
     place_pos = np.array(place_pos) if place_pos else np.zeros((0, 2))
@@ -514,14 +621,35 @@ def generate_goal_relevant_pddl(
         )
         return G.get_node(ns).attributes.position[:2]
 
+    # Names already declared in the problem independently of the scene graph --
+    # i.e. the robot start place "pstart", which goes into (:objects) and
+    # (:init) below, so a goal like "(and (at-poi pstart))" ("return to start")
+    # is well-formed even though no scene symbol is named pstart. Snapshotted
+    # before the loop on purpose: every name added to `selected` inside the loop
+    # came from `by_name`, so checking membership live would be equivalent but
+    # order-dependent, and `referenced` is a set with nondeterministic order.
+    predeclared = frozenset(selected)
+
+    missing = []
+
     for name in referenced:
         sym = by_name.get(name)
         if sym is None:
+            if name in predeclared or not could_name_a_scene_symbol(name):
+                # Declared regardless of the scene graph (pstart), or not a
+                # symbol at all (numeric literal / operator from a metric
+                # constraint): neither is a grounding failure.
+                continue
+            # Do NOT skip: the name stays in the goal string, so Fast Downward
+            # would die on the undeclared object (rc 31). Collect every
+            # unresolved name and report them together below, so a caller can
+            # tell "this symbol isn't in the scene graph yet" (go explore) from
+            # "this goal is unachievable".
             logger.warning(
-                "Goal references symbol '%s' not present in the scene graph; "
-                "skipping it during grounding.",
+                "Goal references symbol '%s' not present in the scene graph.",
                 name,
             )
+            missing.append(MissingSymbol(name, kind_hint_for_symbol(name)))
             continue
         selected.setdefault(name, sym)
 
@@ -539,23 +667,56 @@ def generate_goal_relevant_pddl(
                 for fact in generate_place_containment(G):
                     _, p, r = fact
                     region_to_places.setdefault(r, []).append(p)
+            # Region centroid for member ranking (room node position);
+            # falls back to the robot start when the room can't be found.
+            region_centroid = initial_position
+            for node in G.get_layer(spark_dsg.DsgLayers.ROOMS).nodes:
+                if normalize_symbol(node.id.str(True)) == name:
+                    region_centroid = np.array(node.attributes.position[:2])
+                    break
             members = region_to_places.get(name, [])
+            valid_members = []
+            for p in members:
+                if p not in by_name:
+                    logger.warning(
+                        "Region '%s' contains place '%s' from "
+                        "generate_place_containment, but no scene symbol "
+                        "named '%s' exists (place-layer index mismatch?); "
+                        "skipping it.",
+                        name,
+                        p,
+                        p,
+                    )
+                    continue
+                valid_members.append(p)
+            # Rank members by distance to the REGION centroid, not the robot
+            # start: hydra's member places cluster at the capture circle's
+            # rim on the robot's entry side, and robot-start ranking (plus
+            # FD's min-cost place choice) targets that rim -- the executor's
+            # release slop (~2 m measured) then drops the object OUTSIDE the
+            # region. Centroid ranking keeps the representative places in
+            # the region's middle (exploration Task 9, floor3 gate 2).
             members = sorted(
-                members,
+                valid_members,
                 key=lambda p: float(
-                    np.linalg.norm(place_sym_to_pos[p] - initial_position)
+                    np.linalg.norm(place_sym_to_pos[p] - region_centroid)
                 ),
             )[:max_region_places]
             for p in members:
                 selected.setdefault(p, by_name[p])
                 region_membership.append((p, name))
 
+    if missing:
+        # sorted for a deterministic report (`referenced` is a set)
+        raise MissingSymbolError(
+            sorted(missing, key=lambda m: m.name), raw_pddl_goal_string
+        )
+
     add_symbol_positions(G, list(selected.values()))
 
-    # Build connectivity over POIs (places + objects), with the full places
-    # graph reused via a single LayerPlanner.
+    # Build connectivity over POIs (places + objects), reusing the
+    # component-restricted LayerPlanner so every anchor is reachable.
     pois = [s for s in selected.values() if s.layer in ("place", "object")]
-    layer_planner = LayerPlanner(G, spark_dsg.DsgLayers.MESH_PLACES)
     init = [("=", ("total-cost",), 0), ("at-poi", start_symbol.symbol)]
     if len(pois) > 1:
         D = layer_planner.external_distance_matrix([p.position for p in pois])

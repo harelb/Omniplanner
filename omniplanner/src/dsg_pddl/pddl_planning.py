@@ -6,6 +6,7 @@ import time
 import uuid
 from datetime import datetime
 
+from dsg_pddl.grounding_errors import error_for_fd_returncode
 from dsg_pddl.pddl_grounding import GroundedPddlProblem
 from dsg_pddl.pddl_utils import lisp_string_to_ast
 
@@ -20,6 +21,20 @@ FD_TRANSLATE_TIME_LIMIT = os.getenv("OMNIPLANNER_FD_TRANSLATE_TIME_LIMIT", "60")
 DEFAULT_FD_SEARCH = (
     "let(hff, ff(), let(hcea, cea(), lazy_greedy([hff, hcea], preferred=[hff, hcea])))"
 )
+
+
+def resolve_dump_dir():
+    """Directory where the debug domain/problem/plan PDDL dumps are written.
+
+    Defaults to ~/adt4_output/omniplanner/; override with the
+    OMNIPLANNER_DUMP_DIR env var. Created if it doesn't already exist.
+    """
+    dump_dir = os.environ.get("OMNIPLANNER_DUMP_DIR")
+    dump_dir = os.path.expanduser(dump_dir) if dump_dir else os.path.expanduser(
+        "~/adt4_output/omniplanner"
+    )
+    os.makedirs(dump_dir, exist_ok=True)
+    return dump_dir
 
 
 def solve_pddl(problem: GroundedPddlProblem):
@@ -37,17 +52,19 @@ def solve_pddl(problem: GroundedPddlProblem):
         key = str(uuid.uuid4())[:8]
         formatted_str = now.strftime("%Y-%m-%d_%H_%M_%S")
 
+        dump_dir = resolve_dump_dir()
+
         problem_fn = os.path.join(tmpdirname, "problem.pddl")
-        debug_problem_fn = os.path.expanduser(
-            f"~/omniplanner_problem_{formatted_str}_{key}.pddl"
+        debug_problem_fn = os.path.join(
+            dump_dir, f"omniplanner_problem_{formatted_str}_{key}.pddl"
         )
         domain_fn = os.path.join(tmpdirname, "domain.pddl")
-        debug_domain_fn = os.path.expanduser(
-            f"~/omniplanner_domain_{formatted_str}_{key}.pddl"
+        debug_domain_fn = os.path.join(
+            dump_dir, f"omniplanner_domain_{formatted_str}_{key}.pddl"
         )
         plan_fn = os.path.join(tmpdirname, "plan.txt")
-        debug_plan_fn = os.path.expanduser(
-            f"~/omniplanner_plan_{formatted_str}_{key}.pddl"
+        debug_plan_fn = os.path.join(
+            dump_dir, f"omniplanner_plan_{formatted_str}_{key}.pddl"
         )
 
         with open(problem_fn, "w") as fo:
@@ -85,7 +102,22 @@ def solve_pddl(problem: GroundedPddlProblem):
         fd_start = time.perf_counter()
         # Capture FD output instead of letting it stream to the terminal/log;
         # surface it only on failure or at DEBUG.
-        proc = subprocess.run(command, capture_output=True, text=True)
+        #
+        # cwd=tmpdirname: Fast Downward's translate step writes its intermediate
+        # `output.sas` to the PROCESS CWD (a relative path -- see the FD driver's
+        # `--sas-file output.sas`), and the search step reads it back from there.
+        # Under `ros2 launch` the node's CWD is typically `/` (or another
+        # non-writable dir), so translate dies with
+        # `FileNotFoundError: 'output.sas'` (exit 30) and the whole solve -- and
+        # the omniplanner_node process -- crashes on an otherwise trivially
+        # solvable problem. Pin FD's CWD to the per-solve TemporaryDirectory we
+        # already own (domain/problem/plan live there too) so output.sas lands
+        # somewhere writable and isolated. Verified: identical domain+problem
+        # solves in ~0.13 s from a writable CWD but reproduces the exact
+        # FileNotFoundError from a non-writable one.
+        proc = subprocess.run(
+            command, capture_output=True, text=True, cwd=tmpdirname
+        )
         fd_elapsed = time.perf_counter() - fd_start
         logger.info(
             f"fast-downward finished in {fd_elapsed:.3f}s (return code {proc.returncode})"
@@ -107,10 +139,20 @@ def solve_pddl(problem: GroundedPddlProblem):
             )
             logger.warning("fast-downward stdout:\n%s", proc.stdout)
             logger.warning("fast-downward stderr:\n%s", proc.stderr)
-            with open(debug_fn, "w") as fo:
-                fo.write(problem.problem_str)
-            raise Exception(
-                f"Planning failed, please see {debug_fn} for failed problem file."
+            try:
+                with open(debug_fn, "w") as fo:
+                    fo.write(problem.problem_str)
+            except OSError as e:
+                # An unwritable dump path must not mask the real failure with
+                # an OSError -- callers triage on the typed error below.
+                logger.warning(f"Could not write {debug_fn}: {e}")
+            # Triage the FD exit code so a caller can distinguish "no plan
+            # exists" from "the problem file is malformed" from "we ran out of
+            # time". Unknown codes stay a plain PddlSolverError.
+            raise error_for_fd_returncode(
+                proc.returncode,
+                f"Planning failed (fast-downward return code {proc.returncode}), "
+                f"please see {debug_fn} for failed problem file.",
             )
 
     plan = [lisp_string_to_ast(line) for line in lines[:-1]]

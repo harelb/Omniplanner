@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
@@ -473,46 +474,68 @@ class OmniPlannerRos(Node):
                 self.current_planner = name
                 self.plan_time_start = time.time()
 
-            # Poses are resolved lazily; avoid formatting the whole mapping here
-            # (that would force a TF lookup for every configured robot).
-            robot_poses = self.get_robot_poses(self.dsg_frame)
+            try:
+                # Poses are resolved lazily; avoid formatting the whole mapping
+                # here (that would force a TF lookup for every configured robot).
+                robot_poses = self.get_robot_poses(self.dsg_frame)
 
-            plan_request = callback(msg, robot_poses)
-            with self.dsg_lock:
-                plans = full_planning_pipeline(
-                    plan_request, self.dsg_last, self.feedback
-                )
-            self.get_logger().info(
-                f"Planned using robot poses {robot_poses.resolved()}"
-            )
-
-            compiled_plans = compile_plan(self.robot_adaptors, self.dsg_frame, plans)
-            plan_dict = collect_plans(compiled_plans)
-            for robot_name, compiled_plan in plan_dict.items():
-                self.robot_adaptors[robot_name].publish_plan(to_msg(compiled_plan))
-                # TODO: combine markers into single array so that latching works
-                # correctly for multi-robot plans?
-                self.compiled_plan_viz_pub.publish(
-                    to_viz_msg(compiled_plan, robot_name)
+                plan_request = callback(msg, robot_poses)
+                with self.dsg_lock:
+                    plans = full_planning_pipeline(
+                        plan_request, self.dsg_last, self.feedback
+                    )
+                self.get_logger().info(
+                    f"Planned using robot poses {robot_poses.resolved()}"
                 )
 
-            # Plugin extension point: let the plugin react to a freshly
-            # compiled plan (e.g. to publish derived information such as the
-            # set of POIs visited by the new plan). Optional; plugins that
-            # don't define this method are unaffected.
-            on_plan_compiled = getattr(plugin, "on_plan_compiled", None)
-            if on_plan_compiled is not None:
-                try:
-                    on_plan_compiled(plans, plan_dict)
-                except Exception as exc:
-                    self.get_logger().warning(
-                        f"on_plan_compiled hook for plugin {name} raised: {exc}"
+                compiled_plans = compile_plan(
+                    self.robot_adaptors, self.dsg_frame, plans
+                )
+                plan_dict = collect_plans(compiled_plans)
+                for robot_name, compiled_plan in plan_dict.items():
+                    self.robot_adaptors[robot_name].publish_plan(
+                        to_msg(compiled_plan)
+                    )
+                    # TODO: combine markers into single array so that latching
+                    # works correctly for multi-robot plans?
+                    self.compiled_plan_viz_pub.publish(
+                        to_viz_msg(compiled_plan, robot_name)
                     )
 
-            with self.current_planner_lock and self.plan_time_start_lock:
-                self.current_planner = None
-                self.plan_time_start = None
-            self.get_logger().info("Published Plan")
+                # Plugin extension point: let the plugin react to a freshly
+                # compiled plan (e.g. to publish derived information such as the
+                # set of POIs visited by the new plan). Optional; plugins that
+                # don't define this method are unaffected.
+                on_plan_compiled = getattr(plugin, "on_plan_compiled", None)
+                if on_plan_compiled is not None:
+                    try:
+                        on_plan_compiled(plans, plan_dict)
+                    except Exception as exc:
+                        self.get_logger().warning(
+                            f"on_plan_compiled hook for plugin {name} raised: {exc}"
+                        )
+
+                self.get_logger().info("Published Plan")
+            except Exception:
+                # A failed or crashing solve must NEVER kill the node. An
+                # unhandled exception raised inside an rclpy subscription
+                # callback propagates up through the executor and terminates the
+                # process, taking down planning for the entire run (observed in
+                # task 15j: solve_pddl raised "Planning failed" on one goal and
+                # the node died, so every later goal got no plan). Log the full
+                # traceback and return a plan-failure to the caller (no plan
+                # published) so the node stays alive for the next request.
+                self.get_logger().error(
+                    f"Planning failed for plugin {name}; no plan published. "
+                    f"Traceback:\n{traceback.format_exc()}"
+                )
+            finally:
+                # Always clear the in-flight planner state so the heartbeat
+                # reports "Ready to plan!" and the next request is accepted,
+                # whether the solve succeeded or raised.
+                with self.current_planner_lock and self.plan_time_start_lock:
+                    self.current_planner = None
+                    self.plan_time_start = None
 
         resolved_topic_name = name + "/" + topic
         self.get_logger().info(
