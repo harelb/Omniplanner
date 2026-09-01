@@ -507,7 +507,7 @@ _NON_SYMBOL_TOKENS = {
     "holding", "hand-full", "object-in-place", "place-in-region",
     "object-in-region",
     "visited-poi", "visited-place", "visited-object", "visited-region",
-    "safe", "distance", "total-cost",
+    "safe", "processed-with", "distance", "total-cost",
 }
 
 
@@ -819,10 +819,14 @@ def extract_all_symbols(G):
 
 
 def generate_rearrangement_pddl(
-    G, raw_pddl_goal_string, initial_position, scene_scope=DEFAULT_SCENE_SCOPE
+    G,
+    raw_pddl_goal_string,
+    initial_position,
+    scene_scope=DEFAULT_SCENE_SCOPE,
+    *,
+    problem_domain="object-rearrangement-domain",
 ):
-    problem_name = "object-rearrangement-domain"
-    problem_domain = "object-rearrangement-domain"
+    problem_name = problem_domain
 
     if scene_scope == "goal_relevant":
         return generate_goal_relevant_pddl(
@@ -933,6 +937,14 @@ def ground_problem(
         case "object-rearrangement-domain":
             pddl_problem, symbols = generate_rearrangement_pddl(
                 dsg, goal.pddl_goal, start, scene_scope=scene_scope
+            )
+        case "open-set-rearrangement-domain":
+            pddl_problem, symbols = generate_rearrangement_pddl(
+                dsg,
+                goal.pddl_goal,
+                start,
+                scene_scope=scene_scope,
+                problem_domain="open-set-rearrangement-domain",
             )
         case "region-object-rearrangement-domain":
             pddl_problem, symbols = generate_region_pddl(

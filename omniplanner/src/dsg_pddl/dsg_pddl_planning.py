@@ -72,6 +72,18 @@ def parameterize_place_object_multirobot(layer_planner, symbols, action, last_po
     )
 
 
+def parameterize_use_tool(layer_planner, symbols, action, last_pose):
+    del layer_planner
+    tool_position = symbols[action[2]].position
+    return [last_pose, tool_position]
+
+
+def parameterize_use_tool_multirobot(layer_planner, symbols, action, last_pose):
+    return parameterize_use_tool(
+        layer_planner, symbols, drop_index(action, 1), last_pose
+    )
+
+
 @dispatch
 def make_plan(grounded_problem: GroundedPddlProblem, map_context: Any) -> PddlPlan:
     plan = solve_pddl(grounded_problem)
@@ -148,6 +160,16 @@ def make_plan(grounded_problem: GroundedPddlProblem, map_context: Any) -> PddlPl
                     )
                 else:
                     path = parameterize_place_object(
+                        layer_planner, grounded_problem.symbols, p, last_pose
+                    )
+                parameterized_plan.append(path)
+            case "use-tool":
+                if multirobot:
+                    path = parameterize_use_tool_multirobot(
+                        layer_planner, grounded_problem.symbols, p, last_pose
+                    )
+                else:
+                    path = parameterize_use_tool(
                         layer_planner, grounded_problem.symbols, p, last_pose
                     )
                 parameterized_plan.append(path)
