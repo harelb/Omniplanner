@@ -511,15 +511,18 @@ _NON_SYMBOL_TOKENS = {
 }
 
 
-def collect_goal_symbol_names(ast):
+def collect_goal_symbol_names(ast, extra_non_symbol_tokens=frozenset()):
     """Return the set of scene-symbol names referenced anywhere in a goal AST.
 
     Walks the parsed goal and collects leaf tokens that are not logical
     operators, type names, predicate/function names, or quantifier variables
     (``?x``). Works for ground goals (the usual LLM output) as well as goals
-    that mix predicates and concrete symbols.
+    that mix predicates and concrete symbols. ``extra_non_symbol_tokens`` adds
+    the predicate, function and type names of a domain that extends the stock
+    rearrangement vocabulary, so those names are never mistaken for symbols.
     """
     names = set()
+    non_symbol_tokens = _NON_SYMBOL_TOKENS | set(extra_non_symbol_tokens)
 
     def walk(node):
         if isinstance(node, (tuple, list)):
@@ -527,12 +530,25 @@ def collect_goal_symbol_names(ast):
                 walk(child)
         elif isinstance(node, str):
             tok = node.lower()
-            if tok in _NON_SYMBOL_TOKENS or tok.startswith("?"):
+            if tok in non_symbol_tokens or tok.startswith("?"):
                 return
             names.add(tok)
 
     walk(ast)
     return names
+
+
+def domain_vocabulary_tokens(domain):
+    """Lower-cased predicate, function and type names declared by a PddlDomain."""
+    tokens = set()
+    for clause in (*domain.predicates, *domain.functions):
+        head = clause[0] if isinstance(clause, (tuple, list)) else clause
+        if isinstance(head, str):
+            tokens.add(head.lower())
+    for token in domain.domain_types:
+        if isinstance(token, str) and not token.startswith("?"):
+            tokens.add(token.lower())
+    return frozenset(tokens)
 
 
 def could_name_a_scene_symbol(token):
@@ -562,6 +578,9 @@ def generate_goal_relevant_pddl(
     problem_name,
     problem_domain,
     max_region_places=GOAL_RELEVANT_MAX_REGION_PLACES,
+    *,
+    non_symbol_tokens=frozenset(),
+    extra_symbols=(),
 ):
     """Build a PDDL problem containing only goal-relevant symbols.
 
@@ -571,11 +590,15 @@ def generate_goal_relevant_pddl(
     places per referenced region (so it can be visited). Navigation distances
     are computed pairwise among just these POIs over the full places graph, so a
     single ``goto-poi`` hop represents a full multi-hop traversal whose waypoints
-    are expanded later at plan-compile time.
+    are expanded later at plan-compile time. ``extra_symbols`` names scene
+    symbols to include even though the goal does not mention them (tools or
+    containers an action needs), and ``non_symbol_tokens`` extends the domain
+    vocabulary excluded from symbol collection.
     """
     parsed_pddl_goal = lisp_string_to_ast(raw_pddl_goal_string)
     goal_pddl = simplify(parsed_pddl_goal)
-    referenced = collect_goal_symbol_names(parsed_pddl_goal)
+    referenced = collect_goal_symbol_names(parsed_pddl_goal, non_symbol_tokens)
+    referenced |= {str(name).lower() for name in extra_symbols}
 
     all_symbols = extract_all_symbols(G)
     normalize_symbols(all_symbols)
@@ -825,12 +848,20 @@ def generate_rearrangement_pddl(
     scene_scope=DEFAULT_SCENE_SCOPE,
     *,
     problem_domain="object-rearrangement-domain",
+    non_symbol_tokens=frozenset(),
+    extra_symbols=(),
 ):
     problem_name = problem_domain
 
     if scene_scope == "goal_relevant":
         return generate_goal_relevant_pddl(
-            G, raw_pddl_goal_string, initial_position, problem_name, problem_domain
+            G,
+            raw_pddl_goal_string,
+            initial_position,
+            problem_name,
+            problem_domain,
+            non_symbol_tokens=non_symbol_tokens,
+            extra_symbols=extra_symbols,
         )
 
     parsed_pddl_goal = lisp_string_to_ast(raw_pddl_goal_string)
@@ -926,6 +957,10 @@ def ground_problem(
     # How much of the scene graph to encode (see DEFAULT_SCENE_SCOPE). The
     # domain may carry a config-provided scope; otherwise fall back to default.
     scene_scope = getattr(domain, "scene_scope", None) or DEFAULT_SCENE_SCOPE
+    # Predicate, function and type names declared by this domain are vocabulary,
+    # not scene symbols, even when they extend the stock rearrangement domains.
+    non_symbol_tokens = domain_vocabulary_tokens(domain)
+    extra_symbols = tuple(getattr(goal, "scope_symbols", ()) or ())
 
     # TODO: TBD whether we want to check the domain here and choose how
     # to instantiate the PDDL problem, or if that should be in a separately
@@ -936,7 +971,12 @@ def ground_problem(
             pddl_problem, symbols = generate_inspection_pddl(dsg, goal.pddl_goal, start)
         case "object-rearrangement-domain":
             pddl_problem, symbols = generate_rearrangement_pddl(
-                dsg, goal.pddl_goal, start, scene_scope=scene_scope
+                dsg,
+                goal.pddl_goal,
+                start,
+                scene_scope=scene_scope,
+                non_symbol_tokens=non_symbol_tokens,
+                extra_symbols=extra_symbols,
             )
         case "open-set-rearrangement-domain":
             pddl_problem, symbols = generate_rearrangement_pddl(
@@ -945,6 +985,8 @@ def ground_problem(
                 start,
                 scene_scope=scene_scope,
                 problem_domain="open-set-rearrangement-domain",
+                non_symbol_tokens=non_symbol_tokens,
+                extra_symbols=extra_symbols,
             )
         case "region-object-rearrangement-domain":
             pddl_problem, symbols = generate_region_pddl(

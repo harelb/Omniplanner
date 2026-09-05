@@ -100,6 +100,8 @@ class PddlGoal:
     pddl_goal: str
     robot_id: str
     constraints: list = field(default_factory=list)  # list[ConstraintFact]
+    # Scene symbols to ground even when the goal text does not name them.
+    scope_symbols: list = field(default_factory=list)  # list[str]
 
 
 # TODO: need to reexamine this whole parsing framework as some point.
