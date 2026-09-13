@@ -1,5 +1,4 @@
-"""Non-ROS PDDL plan compilation. Mirrors omniplanner_ros.pddl_planner_ros.compile_pddl_plan
-but without rclpy dependency, so the kinematic simulator can run standalone."""
+"""Shared PDDL action compiler used by the ROS node and hosted viewer."""
 
 from __future__ import annotations
 
@@ -87,6 +86,8 @@ def compile_pddl_plan_pure(
 
     plan = contextualized_plan.value
     context = contextualized_plan.context
+    if len(plan.symbolic_actions) != len(plan.parameterized_actions):
+        raise ValueError("symbolic and parameterized action counts differ")
     actions = []
     for symbolic_action, parameters in zip(
         plan.symbolic_actions, plan.parameterized_actions

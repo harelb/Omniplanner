@@ -144,58 +144,8 @@ def compile_multirobot_pddl_plan(
     return result
 
 
-def compile_pddl_plan(
-    contextualized_plan: SymbolicContext[PddlPlan], plan_id, robot_name, frame_id
-):
-    plan = contextualized_plan.value
-    context = contextualized_plan.context
-    actions = []
-    for symbolic_action, parameters in zip(
-        plan.symbolic_actions, plan.parameterized_actions
-    ):
-        match symbolic_action[0]:
-            case "goto-poi":
-                actions.append(Follow(frame=frame_id, path2d=parameters))
-            case "inspect":
-                robot_point, gaze_point = parameters
-                actions.append(
-                    Gaze(
-                        frame=frame_id,
-                        robot_point=ensure_3d(robot_point),
-                        gaze_point=ensure_3d(gaze_point),
-                        stow_after=True,
-                        object_id=symbolic_action[1],
-                    )
-                )
-            case "pick-object":
-                robot_point, pick_point = parameters
-                actions.append(
-                    Pick(
-                        frame=frame_id,
-                        object_class=_object_class(context, symbolic_action[1]),
-                        robot_point=ensure_3d(robot_point),
-                        object_point=ensure_3d(pick_point),
-                        object_id=symbolic_action[1],
-                    )
-                )
-            case "place-object":
-                robot_point, place_point = parameters
-                actions.append(
-                    Place(
-                        frame=frame_id,
-                        object_class=_object_class(context, symbolic_action[1]),
-                        robot_point=ensure_3d(robot_point),
-                        object_point=ensure_3d(place_point),
-                        object_id=symbolic_action[1],
-                    )
-                )
-            case _:
-                raise NotImplementedError(
-                    f"I don't know how to compile {symbolic_action[0]}"
-                )
-
-    seq = ActionSequence(plan_id=plan_id, robot_name=robot_name, actions=actions)
-    return seq
+# Both the ROS node and hosted viewer use the same production action compiler.
+from dsg_pddl.dsg_pddl_planning_compile import compile_pddl_plan_pure as compile_pddl_plan
 
 
 @dispatch

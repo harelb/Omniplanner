@@ -143,7 +143,7 @@ class RobotPlanningAdaptor:
         # signal the B5 acceptance looks for.
         self.action_results = {}
         result_topic = getattr(config, "action_result_topic", "") or (
-            f"/{self.name}/spot_executor/action_result"
+            f"/{self.name}/spot_executor_node/action_result"
         )
         self.action_result_sub = node.create_subscription(
             ActionResultMsg,
@@ -159,7 +159,7 @@ class RobotPlanningAdaptor:
         self.last_guards = None
         self.last_guards_stamp_s = None
         guards_topic = getattr(config, "runtime_guards_topic", "") or (
-            f"/{self.name}/spot_executor/runtime_guards"
+            f"/{self.name}/spot_executor_node/runtime_guards"
         )
         self.runtime_guards_sub = node.create_subscription(
             RuntimeGuardsMsg,
@@ -219,7 +219,7 @@ class RobotConfig(Config):
     robot_type: str = ""
     body_frame: str = ""
     # PR B5: where this robot's executor publishes ActionResultMsg. Empty ->
-    # the spot_executor convention /<robot_name>/spot_executor/action_result.
+    # the Spot Tools convention /<robot_name>/spot_executor_node/action_result.
     action_result_topic: str = ""
     # PR B8: the executor's RuntimeGuardsMsg topic (same empty-default
     # convention) and the dispatch gate's battery floor.
