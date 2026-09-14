@@ -562,6 +562,7 @@ def generate_goal_relevant_pddl(
     problem_name,
     problem_domain,
     max_region_places=GOAL_RELEVANT_MAX_REGION_PLACES,
+    held_object=None,
 ):
     """Build a PDDL problem containing only goal-relevant symbols.
 
@@ -576,6 +577,7 @@ def generate_goal_relevant_pddl(
     parsed_pddl_goal = lisp_string_to_ast(raw_pddl_goal_string)
     goal_pddl = simplify(parsed_pddl_goal)
     referenced = collect_goal_symbol_names(parsed_pddl_goal)
+    if held_object is not None:referenced.add(held_object)
 
     all_symbols = extract_all_symbols(G)
     normalize_symbols(all_symbols)
@@ -752,6 +754,7 @@ def generate_goal_relevant_pddl(
         init.append(("object-in-place", o, p))
     for p, r in region_membership:
         init.append(("place-in-region", p, r))
+    init = apply_observed_holding(init, held_object, list(selected.values()))
 
     problem = PddlProblem(
         name=problem_name,
@@ -818,6 +821,15 @@ def extract_all_symbols(G):
     return place_symbols + object_symbols + region_symbols
 
 
+def apply_observed_holding(facts, held_object, symbols):
+    """Apply confirmed occupancy to the production initial state, not the goal."""
+    if held_object is None:return facts
+    if not any(s.symbol==held_object and s.layer=='object' for s in symbols):
+        raise ValueError('Observed held object is absent from the planning scene')
+    result=[f for f in facts if not (f[0]=='object-in-place' and f[1]==held_object)]
+    return result+[("holding",held_object),("hand-full",)]
+
+
 def generate_rearrangement_pddl(
     G,
     raw_pddl_goal_string,
@@ -825,12 +837,14 @@ def generate_rearrangement_pddl(
     scene_scope=DEFAULT_SCENE_SCOPE,
     *,
     problem_domain="object-rearrangement-domain",
+    held_object=None,
 ):
     problem_name = problem_domain
 
     if scene_scope == "goal_relevant":
         return generate_goal_relevant_pddl(
-            G, raw_pddl_goal_string, initial_position, problem_name, problem_domain
+            G, raw_pddl_goal_string, initial_position, problem_name, problem_domain,
+            held_object=held_object,
         )
 
     parsed_pddl_goal = lisp_string_to_ast(raw_pddl_goal_string)
@@ -851,6 +865,7 @@ def generate_rearrangement_pddl(
 
     pddl_objects = generate_objects(symbols_of_interest)
     init = generate_dense_init(G, symbols_of_interest, start_place_symbol)
+    init = apply_observed_holding(init, held_object, symbols_of_interest)
 
     problem = PddlProblem(
         name=problem_name,
@@ -936,7 +951,8 @@ def ground_problem(
             pddl_problem, symbols = generate_inspection_pddl(dsg, goal.pddl_goal, start)
         case "object-rearrangement-domain":
             pddl_problem, symbols = generate_rearrangement_pddl(
-                dsg, goal.pddl_goal, start, scene_scope=scene_scope
+                dsg, goal.pddl_goal, start, scene_scope=scene_scope,
+                held_object=getattr(domain,'observed_held_object',None),
             )
         case "open-set-rearrangement-domain":
             pddl_problem, symbols = generate_rearrangement_pddl(
@@ -945,6 +961,7 @@ def ground_problem(
                 start,
                 scene_scope=scene_scope,
                 problem_domain="open-set-rearrangement-domain",
+                held_object=getattr(domain,'observed_held_object',None),
             )
         case "region-object-rearrangement-domain":
             pddl_problem, symbols = generate_region_pddl(
