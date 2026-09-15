@@ -209,6 +209,9 @@ class DsgContextProvider(dict):
                 category = self.dsg.get_labelspace(
                     node_layer, node_partition
                 ).get_node_category(node)
+                admitted = node.attributes.metadata.get().get('admitted_semantics', {})
+                if admitted.get('admission_status') == 'admitted' and admitted.get('class'):
+                    category = admitted['class']
                 symbol_info["semantic_label"] = category
 
         try:

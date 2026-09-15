@@ -452,6 +452,7 @@ def add_symbol_positions(G, symbols):
         ns = spark_dsg.NodeSymbol(dsg_symbol_char, index)
         try:
             node = G.get_node(ns)
+            s.observed_position = np.asarray(node.attributes.position, dtype=float).copy()
             position = node.attributes.position[:2]
         except Exception as e:
             raise MissingSymbolError(

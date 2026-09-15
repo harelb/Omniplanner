@@ -25,13 +25,49 @@ def drop_index(t, k):
     return t[:k] + t[k + 1 :]
 
 
-def parameterize_goto_poi(layer_planner, symbols, action):
+def parameterize_goto_poi(layer_planner, symbols, action, last_pose=None, approach_range=None):
+    start = symbols[action[1]].position if last_pose is None else np.asarray(last_pose)[:2]
+    target = symbols[action[2]]
+    if approach_range is not None and target.layer == 'object':
+        return parameterize_object_approach(layer_planner, start, target.position, approach_range)
     path = layer_planner.get_external_path(
-        symbols[action[1]].position,
-        symbols[action[2]].position,
+        start,
+        target.position,
     )
     last_pose = path[-1]
     return path, last_pose
+
+
+def parameterize_object_approach(layer_planner, start, target, approach_range):
+    """Choose a nominal observed-map stance, never the object's occupied XY.
+
+    The robot-specific range is a planning preference, not an IK or collision
+    certificate. The executor still checks the complete observed swept volume.
+    """
+    low, high = approach_range
+    if not np.isfinite([low, high]).all() or not 0 < low < high:
+        raise ValueError('Object approach range must be finite, positive and ordered')
+    start, target = np.asarray(start)[:2], np.asarray(target)[:2]
+    if low <= np.linalg.norm(start-target) <= high:
+        path = [start, start]
+    else:
+        candidates = [p for p in layer_planner.node_positions
+                      if low <= np.linalg.norm(np.asarray(p)-target) <= high]
+        if not candidates:
+            raise ValueError('No observed navigation place within the object approach range')
+        ranked = [(layer_planner.get_external_distance(start, p), tuple(p)) for p in candidates]
+        cost, selected = min(ranked)
+        if not np.isfinite(cost):
+            raise ValueError('No reachable observed object approach')
+        path = layer_planner.get_external_path(start, np.asarray(selected))
+    yaw = float(np.arctan2(*(target-np.asarray(path[-1]))[::-1]))
+    route = []
+    for i, p in enumerate(path):
+        delta = np.asarray(path[min(i+1,len(path)-1)])-p
+        heading = float(np.arctan2(delta[1],delta[0])) if np.linalg.norm(delta)>1e-6 else yaw
+        route.append([float(p[0]),float(p[1]),heading])
+    route[-1][2] = yaw
+    return route, np.asarray(path[-1])
 
 
 def parameterize_goto_poi_multirobot(layer_planner, symbols, action):
@@ -49,10 +85,9 @@ def parameterize_inspect_multirobot(layer_planner, symbols, action, last_pose):
 
 
 def parameterize_pick_object(layer_planner, symbols, action, last_pose):
-    # The nominal parameter for where the robot should be to pick the object
-    # is the place that the object is in
-    place_position = symbols[action[2]].position
-    return [last_pose, place_position]
+    target = symbols[action[1]]
+    point = target.observed_position if target.observed_position is not None else target.position
+    return [np.asarray(last_pose)[:2], point]
 
 
 def parameterize_pick_object_multirobot(layer_planner, symbols, action, last_pose):
@@ -117,7 +152,7 @@ def make_plan(grounded_problem: GroundedPddlProblem, map_context: Any) -> PddlPl
     ]
     if start_positions:
         layer_planner = layer_planner.restricted_to_components(start_positions)
-    last_pose = np.zeros(2)
+    last_pose = np.asarray(start_positions[0])[:2] if start_positions else np.zeros(2)
     multirobot = "multirobot" in grounded_problem.domain.domain_name
     for p in plan:
         match p[0]:
@@ -128,7 +163,8 @@ def make_plan(grounded_problem: GroundedPddlProblem, map_context: Any) -> PddlPl
                     )
                 else:
                     path, last_pose = parameterize_goto_poi(
-                        layer_planner, grounded_problem.symbols, p
+                        layer_planner, grounded_problem.symbols, p, last_pose,
+                        getattr(grounded_problem.domain, 'object_approach_range_m', None)
                     )
                 parameterized_plan.append(path)
             case "inspect":
