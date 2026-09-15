@@ -73,6 +73,15 @@ class _StubAction:
 
 
 @dataclass
+class _StubGaze:
+    frame: str = ""
+    robot_point: object = None
+    gaze_point: object = None
+    stow_after: bool = True
+    object_id: str = ""
+
+
+@dataclass
 class _StubSequence:
     plan_id: str = ""
     robot_name: str = ""
@@ -91,6 +100,7 @@ def stub_actions(monkeypatch):
     monkeypatch.setattr(mod, "ActionSequence", _StubSequence)
     monkeypatch.setattr(mod, "Pick", _StubAction)
     monkeypatch.setattr(mod, "Place", _StubAction)
+    monkeypatch.setattr(mod, "Gaze", _StubGaze)
     return mod
 
 
@@ -144,7 +154,9 @@ def test_pick_a_then_place_b_uses_bs_class(stub_actions):
     )
     seq = compile_pddl_plan_pure(plan, "plan-1", "euclid", "map")
 
-    pick, place = seq.actions
+    gaze, pick, place = seq.actions
+    assert isinstance(gaze, _StubGaze) and not gaze.stow_after
+    assert np.allclose(gaze.gaze_point, pick.object_point)
     assert pick.object_class == "mug"
     assert place.object_class == "bottle"
 
@@ -157,7 +169,7 @@ def test_pick_then_place_same_object_keeps_its_class(stub_actions):
         [_POINTS, _POINTS],
     )
     seq = compile_pddl_plan_pure(plan, "plan-1", "euclid", "map")
-    assert [a.object_class for a in seq.actions] == ["mug", "mug"]
+    assert [a.object_class for a in seq.actions if not isinstance(a, _StubGaze)] == ["mug", "mug"]
 
 
 def test_unknown_action_still_raises(stub_actions):

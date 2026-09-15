@@ -108,6 +108,16 @@ def compile_pddl_plan_pure(
                 )
             case "pick-object":
                 robot_point, pick_point = parameters
+                # Pick's shared skill detects in the hand camera; its target
+                # point is not an arm command. Aim through the normal Gaze
+                # skill first, retaining the gaze posture for the next Pick.
+                if not (actions and isinstance(actions[-1], Gaze)
+                        and np.allclose(actions[-1].gaze_point, ensure_3d(pick_point))):
+                    actions.append(Gaze(
+                        frame=frame_id, robot_point=ensure_3d(robot_point),
+                        gaze_point=ensure_3d(pick_point), stow_after=False,
+                        object_id=symbolic_action[1],
+                    ))
                 actions.append(
                     Pick(
                         frame=frame_id,
