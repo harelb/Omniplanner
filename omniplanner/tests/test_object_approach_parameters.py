@@ -31,6 +31,24 @@ def test_far_object_approach_uses_reachable_observed_place():
         parameterize_object_approach(planner,[0.,0.],[9.,0.],(.65,1.05))
 
 
+def test_reached_stance_preserves_observed_heading_for_arm_gaze():
+    def forbidden(*a):raise AssertionError('Already in pickup range')
+    planner=SimpleNamespace(get_external_path=forbidden)
+    route,last=parameterize_object_approach(planner,[0.,0.],[0.,.9],(.65,1.05),-.4)
+    assert np.allclose(route,[[0.,0.,-.4],[0.,0.,-.4]])
+    assert np.allclose(last,[0.,0.])
+    with pytest.raises(ValueError,match='heading'):
+        parameterize_object_approach(planner,[0.,0.],[0.,.9],(.65,1.05),float('nan'))
+
+
+def test_travel_to_new_stance_does_not_reuse_old_heading():
+    planner=SimpleNamespace(node_positions=np.array([[2.1,0.]]),
+        get_external_distance=lambda a,b:float(np.linalg.norm(np.array(a)-b)),
+        get_external_path=lambda a,b:[a,b])
+    route,_=parameterize_object_approach(planner,[0.,0.],[3.,0.],(.65,1.05),-.4)
+    assert np.allclose(route[-1],[2.1,0.,0.])
+
+
 def test_following_route_starts_at_actual_previous_standoff():
     planner=SimpleNamespace(get_external_path=lambda a,b:[a,b])
     symbols={'o1':PddlSymbol('o1','object',[],np.array([3.,0.])),

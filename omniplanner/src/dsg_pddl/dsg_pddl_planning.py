@@ -25,11 +25,11 @@ def drop_index(t, k):
     return t[:k] + t[k + 1 :]
 
 
-def parameterize_goto_poi(layer_planner, symbols, action, last_pose=None, approach_range=None):
+def parameterize_goto_poi(layer_planner, symbols, action, last_pose=None, approach_range=None, start_heading=None):
     start = symbols[action[1]].position if last_pose is None else np.asarray(last_pose)[:2]
     target = symbols[action[2]]
     if approach_range is not None and target.layer == 'object':
-        return parameterize_object_approach(layer_planner, start, target.position, approach_range)
+        return parameterize_object_approach(layer_planner, start, target.position, approach_range, start_heading)
     path = layer_planner.get_external_path(
         start,
         target.position,
@@ -38,7 +38,7 @@ def parameterize_goto_poi(layer_planner, symbols, action, last_pose=None, approa
     return path, last_pose
 
 
-def parameterize_object_approach(layer_planner, start, target, approach_range):
+def parameterize_object_approach(layer_planner, start, target, approach_range, start_heading=None):
     """Choose a nominal observed-map stance, never the object's occupied XY.
 
     The robot-specific range is a planning preference, not an IK or collision
@@ -48,7 +48,10 @@ def parameterize_object_approach(layer_planner, start, target, approach_range):
     if not np.isfinite([low, high]).all() or not 0 < low < high:
         raise ValueError('Object approach range must be finite, positive and ordered')
     start, target = np.asarray(start)[:2], np.asarray(target)[:2]
-    if low <= np.linalg.norm(start-target) <= high:
+    stationary = low <= np.linalg.norm(start-target) <= high
+    if start_heading is not None and not np.isfinite(start_heading):
+        raise ValueError('Observed start heading must be finite')
+    if stationary:
         path = [start, start]
     else:
         candidates = [p for p in layer_planner.node_positions
@@ -61,6 +64,10 @@ def parameterize_object_approach(layer_planner, start, target, approach_range):
             raise ValueError('No reachable observed object approach')
         path = layer_planner.get_external_path(start, np.asarray(selected))
     yaw = float(np.arctan2(*(target-np.asarray(path[-1]))[::-1]))
+    # At a reached pickup stance the arm's GAZE action aims at the object.
+    # An extra body turn can sweep the long base footprint into the support.
+    if stationary and start_heading is not None:
+        yaw = float(start_heading)
     route = []
     for i, p in enumerate(path):
         delta = np.asarray(path[min(i+1,len(path)-1)])-p
@@ -153,6 +160,7 @@ def make_plan(grounded_problem: GroundedPddlProblem, map_context: Any) -> PddlPl
     if start_positions:
         layer_planner = layer_planner.restricted_to_components(start_positions)
     last_pose = np.asarray(start_positions[0])[:2] if start_positions else np.zeros(2)
+    last_heading = getattr(grounded_problem.domain, 'observed_start_heading', None)
     multirobot = "multirobot" in grounded_problem.domain.domain_name
     for p in plan:
         match p[0]:
@@ -164,9 +172,11 @@ def make_plan(grounded_problem: GroundedPddlProblem, map_context: Any) -> PddlPl
                 else:
                     path, last_pose = parameterize_goto_poi(
                         layer_planner, grounded_problem.symbols, p, last_pose,
-                        getattr(grounded_problem.domain, 'object_approach_range_m', None)
+                        getattr(grounded_problem.domain, 'object_approach_range_m', None),
+                        last_heading
                     )
                 parameterized_plan.append(path)
+                last_heading = float(path[-1][2]) if len(path[-1]) >= 3 else None
             case "inspect":
                 if multirobot:
                     path = parameterize_inspect_multirobot(
