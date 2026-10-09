@@ -1,3 +1,4 @@
+import json
 import logging
 import threading
 import time
@@ -92,8 +93,9 @@ class PlannerConfig(Config):
     plugin: Any = config_field("omniplanner_pipeline", required=False)
 
 
-def evaluate_dispatch_guards(guards, guards_age_s, *, min_battery_percent=10.0,
-                             max_guard_age_s=10.0):
+def evaluate_dispatch_guards(
+    guards, guards_age_s, *, min_battery_percent=10.0, max_guard_age_s=10.0
+):
     """The PR B8 dispatch gate, pure: (latest RuntimeGuardsMsg-like, its age)
     -> (ok, typed_reason). Volatile platform state is checked at DISPATCH
     time only — it is deliberately not planning state (skill contracts name
@@ -112,9 +114,15 @@ def evaluate_dispatch_guards(guards, guards_age_s, *, min_battery_percent=10.0,
         return False, "estop_pressed"
     if guards.power_known and not guards.powered_on:
         return False, "not_powered"
-    if guards.battery_known and guards.battery_percent >= 0.0 \
-            and guards.battery_percent < min_battery_percent:
-        return False, f"battery_below_min({guards.battery_percent:.0f}%<{min_battery_percent:.0f}%)"
+    if (
+        guards.battery_known
+        and guards.battery_percent >= 0.0
+        and guards.battery_percent < min_battery_percent
+    ):
+        return (
+            False,
+            f"battery_below_min({guards.battery_percent:.0f}%<{min_battery_percent:.0f}%)",
+        )
     if guards.lease_known and not guards.lease_owned:
         return False, "lease_not_owned"
     return True, None
@@ -155,7 +163,8 @@ class RobotPlanningAdaptor:
         # PR B8: latest runtime-guard snapshot + the dispatch gate's knobs.
         self._node_clock = node.get_clock()
         self.min_battery_percent = float(
-            getattr(config, "min_battery_percent", 10.0) or 10.0)
+            getattr(config, "min_battery_percent", 10.0) or 10.0
+        )
         self.last_guards = None
         self.last_guards_stamp_s = None
         guards_topic = getattr(config, "runtime_guards_topic", "") or (
@@ -199,8 +208,8 @@ class RobotPlanningAdaptor:
         if self.last_guards_stamp_s is not None:
             age_s = self._node_clock.now().nanoseconds / 1e9 - self.last_guards_stamp_s
         ok, reason = evaluate_dispatch_guards(
-            self.last_guards, age_s,
-            min_battery_percent=self.min_battery_percent)
+            self.last_guards, age_s, min_battery_percent=self.min_battery_percent
+        )
         if not ok:
             self.ros_logger.error(
                 f"[{self.name}] dispatch REFUSED by runtime guard: {reason}"
@@ -374,6 +383,12 @@ class OmniPlannerRos(Node):
         )
 
         self.heartbeat_pub = self.create_publisher(NodeInfoMsg, "~/node_status", 1)
+        # One JSON String per handled goal ({plugin, robot, ok, error}) so UIs can
+        # report planning failures instead of silently never receiving a plan.
+        from std_msgs.msg import String as _String
+
+        self._plan_status_msg = _String
+        self.plan_status_pub = self.create_publisher(_String, "~/plan_status", 10)
         heartbeat_timer_group = MutuallyExclusiveCallbackGroup()
         timer_period_s = 0.1
         self.timer = self.create_timer(
@@ -456,6 +471,19 @@ class OmniPlannerRos(Node):
             self.robot_adaptors, dsg_frame, timeout_s=self.config.tf_timeout_s
         )
 
+    def publish_plan_status(self, plugin, msg, ok, error=""):
+        out = self._plan_status_msg()
+        out.data = json.dumps(
+            {
+                "plugin": plugin,
+                "robot": getattr(msg, "robot_id", ""),
+                "ok": ok,
+                "error": error,
+                "t": time.time(),
+            }
+        )
+        self.plan_status_pub.publish(out)
+
     def register_plugin(self, name, plugin):
         self.get_logger().info(f"Registering subscription plugin {name}")
         msg_type, topic, callback = plugin.get_plan_callback()
@@ -468,6 +496,9 @@ class OmniPlannerRos(Node):
 
             if self.dsg_last is None:
                 self.get_logger().error("Got plan request, but no DSG!")
+                self.publish_plan_status(
+                    name, msg, False, "no scene graph received yet"
+                )
                 return
 
             with self.current_planner_lock, self.plan_time_start_lock:
@@ -520,6 +551,9 @@ class OmniPlannerRos(Node):
                         f"No plan published for plugin {name}; every compiled "
                         "plan was refused by the runtime dispatch guards."
                     )
+                    self.publish_plan_status(
+                        name, msg, False, "plan refused by runtime dispatch guards"
+                    )
                     return
 
                 # Plugin extension point: let the plugin react to a freshly
@@ -537,7 +571,8 @@ class OmniPlannerRos(Node):
                         )
 
                 self.get_logger().info("Published Plan")
-            except Exception:
+                self.publish_plan_status(name, msg, True)
+            except Exception as exc:
                 # A failed or crashing solve must NEVER kill the node. An
                 # unhandled exception raised inside an rclpy subscription
                 # callback propagates up through the executor and terminates the
@@ -549,6 +584,9 @@ class OmniPlannerRos(Node):
                 self.get_logger().error(
                     f"Planning failed for plugin {name}; no plan published. "
                     f"Traceback:\n{traceback.format_exc()}"
+                )
+                self.publish_plan_status(
+                    name, msg, False, f"{type(exc).__name__}: {exc}"
                 )
             finally:
                 # Always clear the in-flight planner state so the heartbeat
