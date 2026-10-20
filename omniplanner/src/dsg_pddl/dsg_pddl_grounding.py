@@ -291,6 +291,39 @@ def generate_object_containment(G):
     return containments
 
 
+def _nearest_3d_place_parent_containments(G, unparented):
+    """Attribute unparented mesh places to the room of their nearest 3-D place.
+
+    (Upstream plan-repair v3 fallback, for graphs that only connect rooms to
+    the 3-D PLACES layer.)
+    """
+    if not unparented:
+        return set()
+    try:
+        places_layer_3d = G.get_layer(spark_dsg.DsgLayers.PLACES)
+    except Exception:
+        return set()
+    place_nodes = list(places_layer_3d.nodes)
+    if not place_nodes:
+        return set()
+    place_centers = np.array([node.attributes.position for node in place_nodes])
+    containments = set()
+    for node in unparented:
+        closest_idx = np.argmin(
+            np.linalg.norm(place_centers - node.attributes.position, axis=1)
+        )
+        parent = place_nodes[closest_idx].get_parent()
+        if parent is not None:
+            containments.add(
+                (
+                    "place-in-region",
+                    normalize_symbol(node.id.str(True)),
+                    normalize_symbol(spark_dsg.NodeSymbol(parent).str(True)),
+                )
+            )
+    return containments
+
+
 def generate_place_containment(G):
     """Build ('place-in-region', place_sym, room_sym) facts.
 
@@ -298,13 +331,13 @@ def generate_place_containment(G):
     extract_all_symbols, object_current_place, the distance LayerPlanner, ...)
     is keyed off MESH_PLACES ("P"). To keep place-in-region facts consistent
     with those, this walks the real-graph shape first and only falls back to
-    a second shape if that yields nothing:
+    other shapes if that yields nothing:
 
       (a) MESH_PLACES nodes parented directly under ROOMS. This is the real
           hydra/camp-graph shape: the region_injector adds room->MESH_PLACES
-          membership, and the 3D PLACES layer may be empty entirely. This is
-          also the original (pre object-in-region-derived-predicate) behavior
-          of this function.
+          membership, and the 3D PLACES layer may be empty entirely. Mesh
+          places with no parent are attributed to the room of their nearest
+          3-D place (upstream plan-repair v3 fallback).
       (b) ROOMS nodes whose children resolve to place-type nodes (3D PLACES
           or MESH_PLACES). This covers scene graphs (e.g. the synthetic test
           fixture in examples/utils.py:build_test_dsg) where MESH_PLACES is
@@ -313,6 +346,8 @@ def generate_place_containment(G):
           parent via insert_edge -- node.parents() stays empty regardless of
           which edges are inserted -- so those fixtures instead parent rooms
           directly over the 3D PLACES layer.
+      (c) If (b) is also empty, every mesh place goes through the
+          nearest-3-D-place fallback.
 
     (b) is run ONLY IF (a) produced zero facts -- it is a fallback, not a
     union. On real hydra maps, rooms parent 3D PLACES nodes *in addition to*
@@ -322,8 +357,11 @@ def generate_place_containment(G):
     index -- corrupting place-in-region truth values for downstream full-scope
     and multirobot consumers. Falling back only when (a) is empty preserves
     the toy fixture (whose MESH_PLACES layer never has parents, so (a) is
-    always empty there) while restoring exact pre-change behavior -- (a) only
-    -- on real graphs.
+    always empty there) while keeping (a) authoritative on real graphs.
+
+    Logs a warning when regions exist but no fact could be derived: region
+    goals derive through place-in-region, so every (explored-region ?r) would
+    be vacuously true.
     """
     try:
         places_layer_2d = G.get_layer(spark_dsg.DsgLayers.MESH_PLACES)
@@ -333,12 +371,33 @@ def generate_place_containment(G):
         except Exception:
             places_layer_2d = None
 
+    containments = _place_containment_facts(G, places_layer_2d)
+
+    try:
+        n_regions = G.get_layer(spark_dsg.DsgLayers.ROOMS).num_nodes()
+    except Exception:
+        n_regions = 0
+    if n_regions > 0 and not containments:
+        # Region goals derive through place-in-region; with no facts every
+        # (explored-region ?r) is vacuously true and the goal is silently free.
+        logger.warning(
+            "No place-in-region facts derivable for %d region(s): region goals "
+            "will be vacuously satisfied. Check that mesh places parent to rooms.",
+            n_regions,
+        )
+    return containments
+
+
+def _place_containment_facts(G, places_layer_2d):
     # (a) MESH_PLACES nodes' parents -- the real-graph shape.
     containments_a = set()
+    unparented = []
     if places_layer_2d is not None:
         for node in places_layer_2d.nodes:
+            parented = False
             for parent in node.parents():
                 if parent is not None:
+                    parented = True
                     containments_a.add(
                         (
                             "place-in-region",
@@ -346,8 +405,11 @@ def generate_place_containment(G):
                             normalize_symbol(spark_dsg.NodeSymbol(parent).str(True)),
                         )
                     )
+            if not parented:
+                unparented.append(node)
 
     if containments_a:
+        containments_a |= _nearest_3d_place_parent_containments(G, unparented)
         return sorted(containments_a)
 
     try:
@@ -384,7 +446,11 @@ def generate_place_containment(G):
                     )
                 )
 
-    return sorted(containments_b)
+    if containments_b:
+        return sorted(containments_b)
+
+    # (c) last resort: nearest 3-D place's room for every mesh place.
+    return sorted(_nearest_3d_place_parent_containments(G, unparented))
 
 
 def generate_dense_init(G, symbols_of_interest, start_symbol):
@@ -452,7 +518,8 @@ def add_symbol_positions(G, symbols):
         ns = spark_dsg.NodeSymbol(dsg_symbol_char, index)
         try:
             node = G.get_node(ns)
-            position = node.attributes.position[:2]
+            # A copy: the attribute array is a view into the graph's storage.
+            position = np.array(node.attributes.position[:2])
         except Exception as e:
             raise MissingSymbolError(
                 symbol=ns,

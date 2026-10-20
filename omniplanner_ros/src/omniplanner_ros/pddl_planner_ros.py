@@ -180,6 +180,8 @@ def compile_pddl_plan(
                 )
             case "place-object":
                 robot_point, place_point = parameters
+                # Looked up here, not carried over from the pick: a plan that
+                # starts with the object already in hand has no pick.
                 actions.append(
                     Place(
                         frame=frame_id,
