@@ -131,8 +131,18 @@ def evaluate_dispatch_guards(
             f"battery_below_min({guards.battery_percent:.0f}%<{min_battery_percent:.0f}%)",
         )
     if guards.lease_known and not guards.lease_owned:
-        return False, "lease_not_owned"
+        # lease_owner is newer than the rest of the message
+        owner = str(getattr(guards, "lease_owner", "") or "")
+        return False, f"lease_not_owned(held by {owner})" if owner else "lease_not_owned"
     return True, None
+
+
+def format_refusals(refusals):
+    """{robot: refusal reason} -> the plan_status error of a fully refused plan."""
+    reason = "plan refused by runtime dispatch guards"
+    if refusals:
+        reason += ": " + "; ".join(f"{r}: {why}" for r, why in sorted(refusals.items()))
+    return reason
 
 
 class RobotPlanningAdaptor:
@@ -544,17 +554,18 @@ class OmniPlannerRos(Node):
             combined = combine_plan_markers(self.plan_markers)
             self.compiled_plan_viz_pub.publish(combined)
 
-    def publish_plan_status(self, plugin, msg, ok, error=""):
+    def publish_plan_status(self, plugin, msg, ok, error="", refusals=None):
         out = self._plan_status_msg()
-        out.data = json.dumps(
-            {
-                "plugin": plugin,
-                "robot": getattr(msg, "robot_id", ""),
-                "ok": ok,
-                "error": error,
-                "t": time.time(),
-            }
-        )
+        status = {
+            "plugin": plugin,
+            "robot": getattr(msg, "robot_id", ""),
+            "ok": ok,
+            "error": error,
+            "t": time.time(),
+        }
+        if refusals:
+            status["refusals"] = dict(refusals)  # {robot: dispatch-guard reason}
+        out.data = json.dumps(status)
         self.plan_status_pub.publish(out)
 
     def register_plugin(self, name, plugin):
@@ -626,6 +637,7 @@ class OmniPlannerRos(Node):
                 # reach the on_plan_compiled hook, must not be announced on
                 # ~/plan_robots, and must not be reported as published.
                 published_dict = {}
+                refusals = {}
                 for robot_name, compiled_plan in plan_dict.items():
                     published, refusal_reason = self.robot_adaptors[
                         robot_name
@@ -635,6 +647,7 @@ class OmniPlannerRos(Node):
                             f"Plan for robot {robot_name} (plugin {name}) was "
                             f"NOT published: {refusal_reason}"
                         )
+                        refusals[robot_name] = refusal_reason
                         continue
                     published_dict[robot_name] = compiled_plan
                     self.publish_plan_markers(
@@ -647,12 +660,14 @@ class OmniPlannerRos(Node):
                     )
 
                 if not published_dict:
-                    reason = "plan refused by runtime dispatch guards"
+                    reason = format_refusals(refusals)
                     self.get_logger().warning(
                         f"No plan published for plugin {name}; every compiled "
                         "plan was refused by the runtime dispatch guards."
                     )
-                    self.publish_plan_status(name, msg, False, reason)
+                    self.publish_plan_status(
+                        name, msg, False, reason, refusals=refusals
+                    )
                     # Whoever paused the executor for this plan (the goal
                     # manager) must hear that nothing is coming.
                     if not superseded():
@@ -679,7 +694,8 @@ class OmniPlannerRos(Node):
                         )
 
                 self.get_logger().info("Published Plan")
-                self.publish_plan_status(name, msg, True)
+                # a multi-robot plan may have been refused for some robots
+                self.publish_plan_status(name, msg, True, refusals=refusals)
             except Exception as exc:
                 # A failed or crashing solve must NEVER kill the node. An
                 # unhandled exception raised inside an rclpy subscription
