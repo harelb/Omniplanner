@@ -19,7 +19,11 @@ from dsg_pddl.pddl_grounding import (
     PddlProblem,
     PddlSymbol,
 )
-from dsg_pddl.pddl_utils import extract_facts, lisp_string_to_ast, pddl_char_to_dsg_char
+from dsg_pddl.pddl_utils import (
+    extract_facts,
+    lisp_string_to_ast,
+    pddl_symbol_to_node_symbol,
+)
 from omniplanner.omniplanner import RobotWrapper
 from omniplanner.tsp import LayerPlanner
 
@@ -512,10 +516,8 @@ def add_symbol_positions(G, symbols):
     for s in symbols:
         if s.position is not None:
             continue
-        pddl_symbol_char = s.symbol[0]
-        dsg_symbol_char = pddl_char_to_dsg_char(pddl_symbol_char)
-        index = int(s.symbol[1:])
-        ns = spark_dsg.NodeSymbol(dsg_symbol_char, index)
+        ns = pddl_symbol_to_node_symbol(G, s.symbol)
+        dsg_symbol_char, index = ns.category, ns.category_id
         try:
             node = G.get_node(ns)
             # A copy: the attribute array is a view into the graph's storage.
@@ -683,10 +685,7 @@ def generate_goal_relevant_pddl(
     region_to_places = None
 
     def obj_position(obj_sym):
-        ns = spark_dsg.NodeSymbol(
-            pddl_char_to_dsg_char(obj_sym[0]), int(obj_sym[1:])
-        )
-        return G.get_node(ns).attributes.position[:2]
+        return G.get_node(pddl_symbol_to_node_symbol(G, obj_sym)).attributes.position[:2]
 
     # Names already declared in the problem independently of the scene graph --
     # i.e. the robot start place "pstart", which goes into (:objects) and
