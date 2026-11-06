@@ -37,7 +37,7 @@ Dependencies = Dict[str, Tuple[str, Tuple[float, float]]]
 
 
 def plan_dependencies(plans: Iterable) -> Dependencies:
-    """Objects a set of compiled plans acts on, from their Pick and Gaze actions.
+    """Objects a set of compiled plans acts on, from their Pick, DragStart and Gaze actions.
 
     A Place is left out: its object is in a gripper, not in the scene, and its
     destination is a place, which observations do not move.
@@ -48,6 +48,8 @@ def plan_dependencies(plans: Iterable) -> Dependencies:
             kind = type(a).__name__
             if kind == "Pick":
                 xy = a.object_point
+            elif kind == "DragStart":  # a heavy object, dragged (drag_actions)
+                xy, kind = a.object_point, "Drag"
             elif kind == "Gaze":
                 xy = a.gaze_point
             else:

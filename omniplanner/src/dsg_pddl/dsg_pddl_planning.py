@@ -188,6 +188,20 @@ def make_plan(grounded_problem: GroundedPddlProblem, map_context: Any) -> PddlPl
                         layer_planner, grounded_problem.symbols, p, last_pose
                     )
                 parameterized_plan.append(path)
+            case "start-drag" | "release-drag":
+                # Like pick/place: the robot is already there (a goto brought
+                # it), and the nominal point is the place the object is
+                # grasped at, or let go at. The drag itself rides on the gotos
+                # in between.
+                if multirobot:
+                    path = parameterize_place_object_multirobot(
+                        layer_planner, grounded_problem.symbols, p, last_pose
+                    )
+                else:
+                    path = parameterize_place_object(
+                        layer_planner, grounded_problem.symbols, p, last_pose
+                    )
+                parameterized_plan.append(path)
             case "use-tool":
                 if multirobot:
                     path = parameterize_use_tool_multirobot(

@@ -15,6 +15,7 @@ from dsg_pddl.dsg_pddl_planning_compile import _object_class
 from dsg_pddl.pddl_grounding import PddlDomain, PddlGoal
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
+from omniplanner.drag_actions import DragRelease, DragStart
 from omniplanner.omniplanner import (
     MultiRobotWrapper,
     PlanRequest,
@@ -34,6 +35,7 @@ from robot_executor_interface.action_descriptions import (
     Place,
 )
 
+import omniplanner_ros.drag_actions_ros  # noqa: F401  (registers DRAG_* to_msg)
 from omniplanner_ros.omniplanner_node import PhoenixPlanningAdaptor
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,8 @@ def project_multirobot_plan(plan):
             case "pick-object":
                 return (action[0],) + (action[2:])
             case "place-object":
+                return (action[0],) + (action[2:])
+            case "start-drag" | "release-drag":
                 return (action[0],) + (action[2:])
             case _:
                 raise ValueError(f"Don't know how to project {action}")
@@ -191,6 +195,20 @@ def compile_pddl_plan(
                         object_id=symbolic_action[1],
                     )
                 )
+            case "start-drag" | "release-drag":
+                # Grasp a heavy object and drag it along the following Follow
+                # actions; let go at the destination (omniplanner.drag_actions).
+                robot_point, drag_point = parameters
+                cls = DragStart if symbolic_action[0] == "start-drag" else DragRelease
+                actions.append(
+                    cls(
+                        frame=frame_id,
+                        object_class=_object_class(context, symbolic_action[1]),
+                        robot_point=ensure_3d(robot_point),
+                        object_point=ensure_3d(drag_point),
+                        object_id=symbolic_action[1],
+                    )
+                )
             case _:
                 raise NotImplementedError(
                     f"I don't know how to compile {symbolic_action[0]}"
@@ -230,6 +248,10 @@ def compile_phoenix_pddl_plan(contextualized_plan, robot_name, frame_id):
                 logger.error("Phoenix doesn't know how to pick-object :(. Skipping!")
             case "place-object":
                 logger.error("Phoenix doesn't know how to place-object :(. Skipping!")
+            case "start-drag" | "release-drag":
+                logger.error(
+                    f"Phoenix doesn't know how to {symbolic_action[0]} :(. Skipping!"
+                )
             case _:
                 raise NotImplementedError(
                     f"I don't know how to compile {symbolic_action[0]}"

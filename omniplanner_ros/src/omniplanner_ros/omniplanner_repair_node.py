@@ -45,8 +45,10 @@ import threading
 import numpy as np
 import rclpy
 import spark_dsg
+from dsg_pddl.manipulation import is_heavy
 from dsg_pddl.pddl_grounding import ConstraintFact
 from heracles_ros_interfaces.msg import SceneChangeMsg
+from omniplanner.drag_actions import DragRelease
 from omniplanner.plan_validity import (
     affecting_changes,
     broken_route,
@@ -192,7 +194,7 @@ class OmniPlannerRepairRos(OmniPlannerRos):
                 f"{msg.robot_name} {msg.action_type.lower()} done: {sorted(new)}"
             )
         obj = (msg.object_id or "").lower()
-        if msg.action_type in ("PICK", "GAZE") and msg.success and obj:
+        if msg.action_type in ("PICK", "DRAG_START", "GAZE") and msg.success and obj:
             with self._plan_lock:
                 self._plan_deps.pop(obj, None)  # done: a later move no longer matters
             self._pick_failures.pop(obj, None)
@@ -435,8 +437,10 @@ class OmniPlannerRepairRos(OmniPlannerRos):
                 )
                 continue
             here = np.array([float(pose[0]), float(pose[1]), float(pose[2])])
+            dsg = self._current_dsg()
             put_down = [
-                Place(
+                # a heavy object is being dragged, not carried: let go of it
+                (DragRelease if is_heavy(dsg, obj) else Place)(
                     frame=self.dsg_frame,
                     object_class="",
                     robot_point=here,

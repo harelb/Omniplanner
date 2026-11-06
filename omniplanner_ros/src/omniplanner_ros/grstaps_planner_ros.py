@@ -16,6 +16,7 @@ import numpy as np
 import omniplanner.compile_plan  # NOQA: F401  (registers compile_plan dispatches)
 import spark_config as sc
 from dsg_pddl.pddl_grounding import ConstraintFact
+from omniplanner.drag_actions import DragRelease, DragStart
 from omniplanner.grstaps_planner import (
     GrstapsDomain,
     GrstapsGoal,
@@ -45,6 +46,8 @@ from robot_executor_interface.action_descriptions import (
 )
 from std_msgs.msg import String
 
+import omniplanner_ros.drag_actions_ros  # noqa: F401  (registers DRAG_* to_msg)
+from omniplanner_ros.omniplanner_node import PhoenixPlanningAdaptor
 from omniplanner_ros.pddl_planner_ros import ensure_3d
 
 logger = logging.getLogger(__name__)
@@ -122,6 +125,33 @@ def _task_actions(geometry, task, frame_id, robot_point):
                 object_id=target,
             )
         ]
+
+    if kind in ("drag", "start-drag", "release-drag"):
+        # A heavy object: grasp it and drag it along the carry route, then let
+        # go at the destination (omniplanner.drag_actions).
+        def drag_half(cls, robot_at, at):
+            return cls(
+                frame=frame_id,
+                object_class=object_class,
+                robot_point=robot_at,
+                object_point=at,
+                object_id=target,
+            )
+
+        if kind == "start-drag":
+            return [drag_half(DragStart, here, object_point)]
+        if kind == "release-drag":
+            # object_point is already the destination, as for place
+            return [drag_half(DragRelease, here, object_point)]
+        actions = [drag_half(DragStart, here, object_point)]
+        carry = g.get("carry_path")
+        destination = g.get("dest_point")
+        if destination is None:
+            return actions + [drag_half(DragRelease, here, object_point)]
+        if carry is not None and len(carry) >= 2:
+            actions.append(Follow(frame=frame_id, path2d=carry))
+            return actions + [drag_half(DragRelease, ensure_3d(carry[-1]), destination)]
+        return actions + [drag_half(DragRelease, destination, destination)]
 
     pick = Pick(
         frame=frame_id,
@@ -221,14 +251,49 @@ def _ordering(plan: GrstapsPlan):
     return predecessors, coalitions
 
 
-def compile_grstaps_plan(plan: GrstapsPlan, plan_id, robot_name, frame_id):
+def _drop_ungated(predecessors, coalitions, plan, ungated):
+    """Remove waits on robots whose executor never reports task progress.
+
+    A Husky's phoenix executor follows a bare Path: it never announces a task
+    finished or itself ready, so a Spot waiting on one of its tasks, or on it
+    joining a coalition, would wait forever.
+    """
+    if not ungated:
+        return predecessors, coalitions
+    performers = {}
+    for agent in plan.agents or []:
+        for task_id in agent.get("individual_plan") or []:
+            performers.setdefault(str(task_id), set()).add(agent.get("name"))
+
+    def waits_on_gated(p):
+        task, _, robot = p.partition("@")
+        if robot:
+            return robot not in ungated
+        who = performers.get(task, set())
+        return not who or bool(who - set(ungated))
+
+    predecessors = {
+        t: [p for p in prior if waits_on_gated(p)] for t, prior in predecessors.items()
+    }
+    coalitions = {
+        t: [r for r in members if r not in ungated] for t, members in coalitions.items()
+    }
+    return predecessors, {t: m for t, m in coalitions.items() if len(m) > 1}
+
+
+def compile_grstaps_plan(
+    plan: GrstapsPlan, plan_id, robot_name, frame_id, ungated_robots=()
+):
     """One robot's schedule as drive-then-act, task by task.
 
     Timepoints are still dropped -- ActionSequence has no temporal fields, and
     the schedule goes out separately on TaskScheduleMsg -- but the ordering
-    they encoded now travels with the actions.
+    they encoded now travels with the actions. Robots in ``ungated_robots``
+    (Huskies) are never waited on; see _drop_ungated.
     """
-    predecessors, coalitions = _ordering(plan)
+    predecessors, coalitions = _drop_ungated(
+        *_ordering(plan), plan, set(ungated_robots or ())
+    )
     actions = []
     at = None
     # Objects this robot already holds: carry each to where the goal wants it
@@ -239,8 +304,9 @@ def compile_grstaps_plan(plan: GrstapsPlan, plan_id, robot_name, frame_id):
         if len(carry):
             actions.append(Follow(frame=frame_id, path2d=carry))
             at = carry[-1]
+        # a heavy object in hand is being dragged: let go rather than place
         actions.append(
-            Place(
+            (DragRelease if held.get("dragged") else Place)(
                 frame=frame_id,
                 object_class=held["object_class"] or "",
                 robot_point=ensure_3d(at) if at is not None else held["dest_point"],
@@ -281,9 +347,48 @@ def compile_grstaps_plan(plan: GrstapsPlan, plan_id, robot_name, frame_id):
     return ActionSequence(plan_id=plan_id, robot_name=robot_name, actions=actions)
 
 
+def compile_grstaps_path(plan: GrstapsPlan, robot_name, frame_id):
+    """A Husky's (phoenix) share of a fleet plan: its legs as one nav_msgs Path.
+
+    The phoenix executor only follows a path, so inspections (and anything else
+    that actuates) are dropped, as the fast-downward phoenix compile does. It
+    is never given a manipulation: the husky species has no arm.
+    """
+    from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import Path
+    from rclpy.clock import Clock
+
+    path = Path()
+    path.header.frame_id = frame_id
+    path.header.stamp = Clock().now().to_msg()
+    for leg, task in _agent_steps(plan, robot_name):
+        kind = (plan.task_geometry.get(task.get("id")) or {}).get("action")
+        if kind not in (None, "visit", "inspect"):
+            logger.error(
+                "%s cannot %s (task %r); skipping it",
+                robot_name,
+                kind,
+                task.get("name"),
+            )
+        elif kind == "inspect":
+            logger.warning(
+                "%s cannot inspect; it only drives to %s", robot_name, task.get("name")
+            )
+        for xy in leg if leg is not None else []:
+            pose = PoseStamped()
+            pose.header.frame_id = frame_id
+            pose.pose.position.x = float(xy[0])
+            pose.pose.position.y = float(xy[1])
+            pose.pose.orientation.w = 1.0
+            path.poses.append(pose)
+    return path
+
+
 @overload
 @dispatch
 def compile_plan(adaptor, plan_frame: str, p: GrstapsPlan):
+    if isinstance(adaptor, PhoenixPlanningAdaptor):
+        return compile_grstaps_path(p, adaptor.name, plan_frame)
     return compile_grstaps_plan(p, str(uuid.uuid4()), adaptor.name, plan_frame)
 
 
@@ -302,15 +407,20 @@ def compile_plan(
     """
     plan = p.value.value
     plan_id = str(uuid.uuid4())
+    ungated = {
+        (a.name if a is not None else r)
+        for r, a in adaptors.items()
+        if isinstance(a, PhoenixPlanningAdaptor)
+    }
     out = []
     for robot_name in p.names:
         adaptor = adaptors.get(robot_name)
         name = adaptor.name if adaptor is not None else robot_name
-        out.append(
-            RobotWrapper(
-                robot_name, compile_grstaps_plan(plan, plan_id, name, plan_frame)
-            )
-        )
+        if isinstance(adaptor, PhoenixPlanningAdaptor):
+            compiled = compile_grstaps_path(plan, name, plan_frame)
+        else:
+            compiled = compile_grstaps_plan(plan, plan_id, name, plan_frame, ungated)
+        out.append(RobotWrapper(robot_name, compiled))
     return out
 
 
@@ -530,6 +640,11 @@ class GrstapsConfig(sc.Config):
     inspect_duration_s: float = None
     pick_duration_s: float = None
     place_duration_s: float = None
+    drag_start_duration_s: float = None
+    drag_release_duration_s: float = None
+    # False leaves Huskies out of the fleet (the old behaviour); unset plans
+    # with them as the arm-less "husky" species.
+    allow_husky: bool = None
     # How far a forbidden-poi constraint reaches, in metres of navigable path.
     forbidden_radius_m: float = None
     # "pddl"  -> domain/problem.pddl through grstapsx_example
@@ -540,7 +655,7 @@ class GrstapsConfig(sc.Config):
     itags_binary: str = None
     # {robot_name: species} to override what robot_type implies, e.g.
     # {hilbert: spot_arm} when the sim spot stands in for one with an arm.
-    # Species are spot, spot_arm, uav.
+    # Species are spot, spot_arm, uav, husky.
     robot_species: dict = None
     # {robot_type: species} for the whole fleet, e.g. {spot: spot_arm} when
     # every Spot has an arm. robot_species still wins for a named robot.

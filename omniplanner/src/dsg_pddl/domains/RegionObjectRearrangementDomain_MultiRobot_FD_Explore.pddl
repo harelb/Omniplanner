@@ -33,6 +33,10 @@
 
         (safe ?o - dsg_object)
         (explored-region ?reg - region)
+
+        (has-arm ?r - robot)
+        (heavy ?o - dsg_object)
+        (dragging ?r - robot ?o - dsg_object)
     )
 
     (:functions
@@ -103,7 +107,9 @@
 
     (:action pick-object
      :parameters (?r - robot ?o - dsg_object ?p - place)
-     :precondition (and (not (hand-full ?r))
+     :precondition (and (has-arm ?r)
+                        (not (heavy ?o))
+                        (not (hand-full ?r))
                         (safe ?o)
                         (at-object ?r ?o)
                         (object-in-place ?o ?p))
@@ -115,6 +121,25 @@
      :parameters (?r - robot ?o - dsg_object ?p - place)
      :precondition (and (holding ?r ?o) (at-place ?r ?p))
      :effect (and (not (holding ?r ?o))
+                  (not (hand-full ?r))
+                  (object-in-place ?o ?p)))
+
+    (:action start-drag
+     :parameters (?r - robot ?o - dsg_object ?p - place)
+     :precondition (and (has-arm ?r)
+                        (heavy ?o)
+                        (not (hand-full ?r))
+                        (safe ?o)
+                        (at-object ?r ?o)
+                        (object-in-place ?o ?p))
+     :effect (and (dragging ?r ?o)
+                  (hand-full ?r)
+                  (not (object-in-place ?o ?p))))
+
+    (:action release-drag
+     :parameters (?r - robot ?o - dsg_object ?p - place)
+     :precondition (and (dragging ?r ?o) (at-place ?r ?p))
+     :effect (and (not (dragging ?r ?o))
                   (not (hand-full ?r))
                   (object-in-place ?o ?p)))
 

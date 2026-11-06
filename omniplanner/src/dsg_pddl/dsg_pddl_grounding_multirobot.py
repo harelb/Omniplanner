@@ -8,8 +8,6 @@ from typing import Any, Dict, List, Tuple
 import networkx as nx
 import numpy as np
 import spark_dsg
-from omniplanner.omniplanner import MultiRobotWrapper
-from omniplanner.tsp import LayerPlanner
 from plum import dispatch
 
 from dsg_pddl.dsg_pddl_grounding import (
@@ -33,6 +31,7 @@ from dsg_pddl.grounding_errors import (
     MissingSymbolError,
     kind_hint_for_symbol,
 )
+from dsg_pddl.manipulation import heavy_objects, robots_with_arms
 from dsg_pddl.pddl_grounding import (
     GroundedPddlProblem,
     MultiRobotPddlDomain,
@@ -45,6 +44,8 @@ from dsg_pddl.pddl_utils import (
     lisp_string_to_ast,
     pddl_symbol_to_node_symbol,
 )
+from omniplanner.omniplanner import MultiRobotWrapper
+from omniplanner.tsp import LayerPlanner
 
 logger = logging.getLogger(__name__)
 
@@ -401,6 +402,55 @@ def filter_goal_for_available_objects(
     return f"(and {' '.join(safe_goals)})"
 
 
+def arm_and_heavy_facts(G, robot_ids, object_symbols, robot_types=None, extra_heavy=()):
+    """Static ``(has-arm r)`` and ``(heavy o)`` facts (dsg_pddl.manipulation).
+
+    Only robots with an arm may pick, place or drag; a heavy object can only be
+    dragged. ``object_symbols`` are the objects in the problem: a heavy fact
+    about any other symbol would name an undeclared object.
+    """
+    facts = [("has-arm", r) for r in robots_with_arms(robot_ids, robot_types)]
+    objects = sorted({str(o).lower() for o in object_symbols})
+    heavy = heavy_objects(G, objects, extra_heavy)
+    facts += [("heavy", o) for o in heavy if o in set(objects)]
+    no_arm = sorted(set(robot_ids) - {f[1] for f in facts if f[0] == "has-arm"})
+    if no_arm or heavy:
+        logger.info(
+            "Manipulation: no arm %s; heavy (dragged) %s", no_arm or "-", heavy or "-"
+        )
+    return facts
+
+
+def _manipulation_hint(raw_pddl_goal_string, init_facts):
+    """Why a manipulation goal cannot be met by these robots, or ""."""
+    try:
+        goal = lisp_string_to_ast(raw_pddl_goal_string)
+    except Exception:
+        return ""
+    moved = [f for f in extract_facts(goal, "object-in-place") if len(f) > 1]
+    held = [f for f in extract_facts(goal, "holding") if len(f) > 2]
+    if not (moved or held):
+        return ""
+    arms = {f[1] for f in init_facts if f and f[0] == "has-arm"}
+    heavy = {f[1] for f in init_facts if f and f[0] == "heavy"}
+    hints = []
+    if not arms:
+        hints.append(
+            "moving an object needs a robot with an arm, and none of the planning "
+            "robots has one"
+        )
+    heavy_held = sorted({f[2] for f in held if f[2] in heavy})
+    if heavy_held:
+        hints.append(
+            f"{', '.join(heavy_held)} is too heavy to pick up and hold (it can only "
+            "be dragged to a place: use object-in-place)"
+        )
+    bound = sorted({f[1] for f in held if f[1] not in arms})
+    if arms and bound:
+        hints.append(f"{', '.join(bound)} has no arm, so it cannot hold an object")
+    return "; ".join(hints)
+
+
 def apply_world_state(init_facts, world_state, symbols, robot_ids):
     """Start the problem from what the mission has already done.
 
@@ -421,8 +471,10 @@ def apply_world_state(init_facts, world_state, symbols, robot_ids):
         for f in init_facts
         if not (f and f[0] == "object-in-place" and len(f) >= 2 and f[1] in held)
     ]
+    # a heavy object in hand is being dragged (released by release-drag)
+    heavy = {f[1] for f in init_facts if f and f[0] == "heavy" and len(f) > 1}
     for obj, robot in sorted(held.items()):
-        facts.append(("holding", robot, obj))
+        facts.append(("dragging" if obj in heavy else "holding", robot, obj))
     for robot in sorted(set(held.values())):
         facts.append(("hand-full", robot))
     facts += [("visited-poi", s) for s in sorted(world_state.visited & known)]
@@ -447,6 +499,8 @@ def generate_multirobot_region_pddl(
     robot_states: np.ndarray,
     constraints=None,
     world_state=None,
+    robot_types=None,
+    heavy_symbols=(),
 ) -> Tuple[str, List[PddlSymbol], str]:
     """Generate a multi-robot PDDL problem for domain region-object-rearrangement-domain-multirobot-fd.
 
@@ -498,6 +552,19 @@ def generate_multirobot_region_pddl(
     init_facts_tuples += [
         ("suspicious", o.symbol) for o in object_symbols if o.symbol not in inspected
     ]
+    init_facts_tuples += arm_and_heavy_facts(
+        G,
+        robot_ids,
+        [o.symbol for o in object_symbols],
+        robot_types,
+        heavy_symbols,
+    )
+    failure_hint = "; ".join(
+        filter(
+            None,
+            [failure_hint, _manipulation_hint(raw_pddl_goal_string, init_facts_tuples)],
+        )
+    )
     if world_state is not None:
         init_facts_tuples = apply_world_state(
             init_facts_tuples, world_state, symbols_of_interest, robot_ids
@@ -757,6 +824,8 @@ def generate_goal_relevant_multirobot_pddl(
     constraints=None,
     world_state=None,
     max_region_places: int = GOAL_RELEVANT_MAX_REGION_PLACES,
+    robot_types=None,
+    heavy_symbols=(),
 ):
     """A multi-robot problem over only the goal-relevant points of interest.
 
@@ -931,6 +1000,14 @@ def generate_goal_relevant_multirobot_pddl(
         for s in symbols
         if s.layer == "object" and s.symbol not in inspected
     ]
+    # only the goal's objects are in the problem, so only they can be heavy
+    init += arm_and_heavy_facts(
+        G,
+        robot_ids,
+        [s.symbol for s in symbols if s.layer == "object"],
+        robot_types,
+        heavy_symbols,
+    )
     if world_state is not None:
         init = apply_world_state(init, world_state, symbols, robot_ids)
 
@@ -954,6 +1031,9 @@ def generate_goal_relevant_multirobot_pddl(
     failure_hint = _failure_hint(
         raw_pddl_goal_string, init, symbols, robot_states, too_far, constraints
     )
+    failure_hint = "; ".join(
+        filter(None, [failure_hint, _manipulation_hint(raw_pddl_goal_string, init)])
+    )
     return problem_str, symbols, failure_hint, planner
 
 
@@ -971,6 +1051,11 @@ def ground_problem(
     # How much of the scene graph to encode (see DEFAULT_SCENE_SCOPE).
     scene_scope = getattr(domain, "scene_scope", None) or DEFAULT_SCENE_SCOPE
     layer_planner = None
+    # Robot names are lowercased for PDDL; match the types to them.
+    robot_types = {
+        str(k).lower(): v for k, v in (getattr(goal, "robot_types", None) or {}).items()
+    }
+    heavy_symbols = list(getattr(goal, "heavy_symbols", None) or [])
     match domain.domain_name:
         # case "goto-object-domain-multirobot-fd":
         #     pddl_problem, symbols = generate_multirobot_inspection_pddl(
@@ -987,6 +1072,8 @@ def ground_problem(
                     pddl_compliant_robot_states,
                     constraints=goal.constraints,
                     world_state=getattr(goal, "world_state", None),
+                    robot_types=robot_types,
+                    heavy_symbols=heavy_symbols,
                 )
             )
         case "region-object-rearrangement-domain-multirobot-fd":
@@ -997,6 +1084,8 @@ def ground_problem(
                 planning_robot_states(pddl_compliant_robot_states, goal.constraints),
                 constraints=goal.constraints,
                 world_state=getattr(goal, "world_state", None),
+                robot_types=robot_types,
+                heavy_symbols=heavy_symbols,
             )
             # logger.warning(f"!!!!!!!!!!!!!!pddl_problem: {pddl_problem}")
         case _:

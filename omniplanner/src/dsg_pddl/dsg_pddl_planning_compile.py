@@ -4,9 +4,10 @@ but without rclpy dependency, so the kinematic simulator can run standalone."""
 from __future__ import annotations
 
 import numpy as np
-from omniplanner.omniplanner import SymbolicContext
 
 from dsg_pddl.dsg_pddl_planning import PddlPlan
+from omniplanner.drag_actions import DragRelease, DragStart
+from omniplanner.omniplanner import SymbolicContext
 
 # robot_executor_interface lives in spot_tools, which is a colcon package and is
 # not necessarily on the path of a plain (non-ROS) virtualenv. Import it
@@ -124,6 +125,18 @@ def compile_pddl_plan_pure(
                         object_class=_object_class(context, symbolic_action[1]),
                         robot_point=ensure_3d(robot_point),
                         object_point=ensure_3d(place_point),
+                        object_id=symbolic_action[1],
+                    )
+                )
+            case "start-drag" | "release-drag":
+                robot_point, drag_point = parameters
+                cls = DragStart if symbolic_action[0] == "start-drag" else DragRelease
+                actions.append(
+                    cls(
+                        frame=frame_id,
+                        object_class=_object_class(context, symbolic_action[1]),
+                        robot_point=ensure_3d(robot_point),
+                        object_point=ensure_3d(drag_point),
                         object_id=symbolic_action[1],
                     )
                 )

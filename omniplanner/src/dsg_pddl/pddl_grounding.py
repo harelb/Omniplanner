@@ -103,6 +103,13 @@ class PddlGoal:
     # What the mission has already done (omniplanner.world_state.WorldState),
     # so a replan only plans what is left. None plans from scratch.
     world_state: object = None
+    # {robot name -> robot_type} (omniplanner_plugins.yaml: spot, husky,
+    # spot-with-manipulator, simulated-spot, ...). Decides which robots get
+    # (has-arm r); empty means every robot has an arm (dsg_pddl.manipulation).
+    robot_types: dict = field(default_factory=dict)
+    # Object symbols to treat as heavy (dragged, never picked up) on top of
+    # those whose class is heavy (dsg_pddl.manipulation.heavy_classes).
+    heavy_symbols: list = field(default_factory=list)
 
 
 # TODO: need to reexamine this whole parsing framework as some point.

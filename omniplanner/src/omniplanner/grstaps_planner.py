@@ -22,6 +22,7 @@ from dsg_pddl.dsg_pddl_grounding_multirobot import (
     FORBIDDEN_RADIUS_ENV,
     _forbidden_radius_m,
 )
+from dsg_pddl.manipulation import NO_ARM_ROBOTS_ENV, heavy_objects, is_heavy
 from dsg_pddl.pddl_utils import lisp_string_to_ast
 from plum import dispatch
 
@@ -95,6 +96,9 @@ SPECIES = {
         "bounding_radius": 1.0,
     },
     "uav": {"traits": _traits(AIR, SENSOR), "speed": 2.0, "bounding_radius": 0.5},
+    # A Husky (phoenix executor): drives and looks, has no arm, so it is never
+    # allocated a pick, place, relocation or drag.
+    "husky": {"traits": _traits(GROUND, SENSOR), "speed": 0.8, "bounding_radius": 1.0},
 }
 DEFAULT_SPECIES = "spot"
 
@@ -107,17 +111,34 @@ ROBOT_TYPE_SPECIES = {
     "uav": "uav",
     "drone": "uav",
     "quadrotor": "uav",
+    "husky": "husky",
+    "phoenix": "husky",
 }
 
 # robot_types whose executor cannot carry out a GRSTAPS-X plan, and why. A plan's
 # actions wait on the tasks they follow and on coalition partners; a robot whose
 # executor ignores those gates breaks the plan for everyone else. It runs its
 # own tasks out of order, and a Spot waiting on one of them -- or on it arriving
-# for a joint task -- waits forever. Such robots are left out of the fleet; a
-# robot_species override for a specific robot puts it back in.
+# for a joint task -- waits forever. Such robots are left out of the fleet only
+# when GrstapsDomain.allow_husky is False; a robot_species override for a
+# specific robot puts it back in. With allow_husky (the default) a Husky plans
+# as the "husky" species (no arm), and its plan compiles to a bare Path; the
+# other robots' actions do not wait on its tasks (omniplanner_ros
+# grstaps_planner_ros.compile_plan), since its executor never reports them.
 UNPLANNABLE_ROBOT_TYPES = {
     "husky": "its phoenix executor does not wait on plan ordering or coalition partners",
 }
+
+
+def _species_without_arm(kind):
+    """The species like ``kind`` but with no manipulator (spot_arm -> spot)."""
+    want = list(SPECIES[kind]["traits"])
+    want[MANIP] = 0
+    for name, spec in SPECIES.items():
+        if list(spec["traits"]) == want:
+            return name
+    logger.warning("No species like %s without an arm; keeping %s", kind, kind)
+    return kind
 
 
 def species_for(robot_type, overrides=None, robot_name=None, type_overrides=None):
@@ -175,6 +196,15 @@ VISIT_DURATION = 5.0
 INSPECT_DURATION = 6.0
 PICK_DURATION = 8.0
 PLACE_DURATION = 8.0
+# Dragging a heavy object: grasp and go into drag mode, then let go at the
+# destination. DRAG_DURATION_S is the two together (the atomic drag-object).
+DRAG_START_DURATION = 12.0
+DRAG_RELEASE_DURATION = 8.0
+DRAG_DURATION_S = DRAG_START_DURATION + DRAG_RELEASE_DURATION
+# A robot dragging walks at this fraction of its speed. The solver charges the
+# carry at full speed (a relocation's terminal configuration), so a drag task
+# gets the difference added to its duration: L / (v * f) - L / v.
+DRAG_SPEED_FACTOR = 0.6
 
 # Robot-agnostic by construction, like every GRSTAPS-X domain: no robot objects,
 # no robot parameters, no trait predicates. Who performs a task is decided
@@ -199,7 +229,9 @@ DOMAIN_PDDL_TEMPLATE = """(define (domain dsg-visit)
     (visited ?l - location)
     (inspected ?l - location)
     (picked ?l - location)
-    (placed ?l - location))
+    (placed ?l - location)
+    (light ?l - location)
+    (heavy ?l - location))
   (:durative-action visit-location
     :parameters (?l - location)
     :duration (= ?duration %(visit)s)
@@ -227,6 +259,17 @@ RELOCATE_ACTION = """  (:durative-action relocate-object
     :parameters (?l - location)
     :duration (= ?duration %(relocate)s)
     :condition (and
+      (at start (light ?l))
+      (at start (inspected ?l))
+      (at start (not (placed ?l))))
+    :effect (and
+      (at end (picked ?l))
+      (at end (placed ?l))))
+  (:durative-action drag-object
+    :parameters (?l - location)
+    :duration (= ?duration %(drag)s)
+    :condition (and
+      (at start (heavy ?l))
       (at start (inspected ?l))
       (at start (not (placed ?l))))
     :effect (and
@@ -240,6 +283,7 @@ PICK_PLACE_ACTIONS = """  (:durative-action pick-object
     :parameters (?l - location)
     :duration (= ?duration %(pick)s)
     :condition (and
+      (at start (light ?l))
       (at start (inspected ?l))
       (at start (not (picked ?l))))
     :effect (and
@@ -248,6 +292,25 @@ PICK_PLACE_ACTIONS = """  (:durative-action pick-object
     :parameters (?l - location)
     :duration (= ?duration %(place)s)
     :condition (and
+      (at start (light ?l))
+      (at start (picked ?l))
+      (at start (not (placed ?l))))
+    :effect (and
+      (at end (placed ?l))))
+  (:durative-action start-drag
+    :parameters (?l - location)
+    :duration (= ?duration %(start_drag)s)
+    :condition (and
+      (at start (heavy ?l))
+      (at start (inspected ?l))
+      (at start (not (picked ?l))))
+    :effect (and
+      (at end (picked ?l))))
+  (:durative-action release-drag
+    :parameters (?l - location)
+    :duration (= ?duration %(release_drag)s)
+    :condition (and
+      (at start (heavy ?l))
       (at start (picked ?l))
       (at start (not (placed ?l))))
     :effect (and
@@ -262,6 +325,14 @@ def _pddl_duration(seconds):
     per action type rather than per instance.
     """
     return f"{float(seconds):g}"
+
+
+def _drag_durations(durations):
+    """(start-drag, release-drag) seconds from a durations dict, defaulted."""
+    return (
+        float(durations.get("start-drag", DRAG_START_DURATION)),
+        float(durations.get("release-drag", DRAG_RELEASE_DURATION)),
+    )
 
 
 def render_domain_pddl(durations, atomic_manipulation=True):
@@ -281,6 +352,9 @@ def render_domain_pddl(durations, atomic_manipulation=True):
         "relocate": _pddl_duration(
             durations["pick-object"] + durations["place-object"]
         ),
+        "start_drag": _pddl_duration(_drag_durations(durations)[0]),
+        "release_drag": _pddl_duration(_drag_durations(durations)[1]),
+        "drag": _pddl_duration(sum(_drag_durations(durations))),
     }
     fill["manipulation"] = (
         RELOCATE_ACTION if atomic_manipulation else PICK_PLACE_ACTIONS
@@ -328,6 +402,12 @@ class GrstapsDomain(PlanningDomain):
     inspect_duration_s: float = INSPECT_DURATION
     pick_duration_s: float = PICK_DURATION
     place_duration_s: float = PLACE_DURATION
+    # Dragging a heavy object (drag-object = the two together).
+    drag_start_duration_s: float = DRAG_START_DURATION
+    drag_release_duration_s: float = DRAG_RELEASE_DURATION
+    # Plan with Huskies (species "husky": ground + sensor, no arm). False leaves
+    # them out of the fleet, as before (UNPLANNABLE_ROBOT_TYPES).
+    allow_husky: bool = True
     # "pddl"  -> domain/problem.pddl through grstapsx_example (task planner runs)
     # "itags" -> itags_input.json straight into the itags binary, which skips
     #            task planning and takes precedence_constraints directly, so an
@@ -424,6 +504,10 @@ class GrstapsGoal:
     # places are the mesh places inside it. The console's operator-drawn
     # mission areas (area1, area2, ...) arrive this way.
     region_polygons: Dict[str, List[List[float]]] = field(default_factory=dict)
+    # Manipulation targets too heavy to lift: they become drag tasks
+    # (drag-object, or start-drag/release-drag) instead of relocations. Grounding
+    # adds every manipulate point whose class is heavy (dsg_pddl.manipulation).
+    heavy_points: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -714,6 +798,7 @@ def enumerate_tasks(
     atomic_manipulation=True,
     inspect_traits=None,
     identity=None,
+    carry_extra_s=None,
 ):
     """Goal -> (tasks, {symbol -> [task indices]}, intrinsic precedence pairs).
 
@@ -729,6 +814,11 @@ def enumerate_tasks(
 
     `identity` ({robot -> trait dim}, see _identity_dims) is needed when the
     goal pins tasks to robots; every vector is then widened to cover it.
+
+    A heavy manipulate point (goal.heavy_points) is dragged instead: one
+    drag-object task, or start-drag then release-drag, demanding a manipulator
+    like a relocation. `carry_extra_s` ({symbol -> seconds}) lengthens a drag
+    for the slower walk while dragging (DRAG_SPEED_FACTOR).
     """
     tasks: List[dict] = []
     of_symbol: Dict[str, List[int]] = {}
@@ -797,9 +887,37 @@ def enumerate_tasks(
             robots=robots,
         )
 
+    heavy = {s.lower() for s in (getattr(goal, "heavy_points", None) or [])}
+    drag_start_s, drag_release_s = _drag_durations(durations)
     for sym in goal.manipulate_points or []:
         dest = (getattr(goal, "manipulate_destinations", None) or {}).get(sym.lower())
-        if atomic_manipulation:
+        extra = float((carry_extra_s or {}).get(sym.lower(), 0.0))
+        if sym.lower() in heavy and atomic_manipulation:
+            # Too heavy to lift: grasp, drag along the carry route, let go --
+            # one task, for the same one-object-at-a-time reason as relocate.
+            first = add(
+                f"drag-object {sym.lower()} :: drag",
+                _traits(MANIP),
+                drag_start_s + drag_release_s + extra,
+                sym,
+                end=dest,
+            )
+        elif sym.lower() in heavy:
+            first = add(
+                f"start-drag {sym.lower()} :: start_drag",
+                _traits(MANIP),
+                drag_start_s,
+                sym,
+            )
+            release = add(
+                f"release-drag {sym.lower()} :: release_drag",
+                _traits(MANIP),
+                drag_release_s + extra,
+                sym,
+                end=dest,
+            )
+            precedence.append([first, release])
+        elif atomic_manipulation:
             # One task from "lift it" to "set it down". The scheduler already
             # gives a robot one task at a time, so making the carry atomic is
             # what turns "carries one object" from likely into guaranteed --
@@ -834,6 +952,42 @@ def enumerate_tasks(
                 precedence.append([prior, first])
 
     return tasks, of_symbol, precedence
+
+
+def drag_carry_extra_s(goal, graph, vertex_of, robot_species=None):
+    """{heavy symbol -> extra seconds} for walking slower while dragging.
+
+    The solver charges a carry at the robot's full speed; a drag is walked at
+    DRAG_SPEED_FACTOR of it, so the task is lengthened by L/(v f) - L/v, L the
+    carry route over ``graph`` and v the slowest armed species in the fleet.
+    """
+    heavy = set(getattr(goal, "heavy_points", None) or [])
+    dests = getattr(goal, "manipulate_destinations", None) or {}
+    pairs = {
+        s: (vertex_of.get(s), vertex_of.get(dests[s]))
+        for s in heavy
+        if s in dests and vertex_of.get(s) and vertex_of.get(dests[s])
+    }
+    if not pairs:
+        return {}
+    speeds = [
+        SPECIES[k.split("@")[0]]["speed"]
+        for k in (robot_species or {}).values()
+        if k.split("@")[0] in SPECIES and SPECIES[k.split("@")[0]]["traits"][MANIP]
+    ]
+    v = min(speeds) if speeds else SPECIES["spot_arm"]["speed"]
+    routes = nx.Graph()
+    routes.add_weighted_edges_from(
+        (e["vertex_a"], e["vertex_b"], e["cost"]) for e in graph.get("edges", [])
+    )
+    out = {}
+    for s, (a, b) in pairs.items():
+        try:
+            length = nx.shortest_path_length(routes, a["id"], b["id"], weight="weight")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue  # reachability is checked (and reported) elsewhere
+        out[s] = float(length) / (v * DRAG_SPEED_FACTOR) - float(length) / v
+    return out
 
 
 def ordering_precedence(constraints, of_symbol):
@@ -1163,7 +1317,15 @@ TASK_ACTION_KINDS = {
     "relocate-object": "relocate",
     "pick-object": "pick",
     "place-object": "place",
+    # heavy objects: the atomic drag, or its two halves
+    "drag-object": "drag",
+    "start-drag": "start-drag",
+    "release-drag": "release-drag",
 }
+# Kinds that move an object to a destination inside the task (with a
+# carry_path), and kinds that end at the destination.
+_CARRY_KINDS = ("relocate", "drag")
+_DROP_KINDS = ("place", "release-drag")
 
 
 def _nearest_place(dsg, symbol):
@@ -1479,13 +1641,15 @@ def _fleet_names(robot_states, goal, domain, quiet=False):
             continue
         robot_type = str((getattr(goal, "robot_types", None) or {}).get(robot_id, ""))
         robot_type = robot_type.strip().lower()
-        if robot_type in UNPLANNABLE_ROBOT_TYPES and robot_id not in (
-            domain.robot_species or {}
+        if (
+            robot_type in UNPLANNABLE_ROBOT_TYPES
+            and not getattr(domain, "allow_husky", True)
+            and robot_id not in (domain.robot_species or {})
         ):
             if not quiet:
                 logger.warning(
                     "Skipping robot %s: a %s cannot execute a GRSTAPS-X plan, since %s. "
-                    "Set robot_species for it to plan with it anyway.",
+                    "Set allow_husky, or robot_species for it, to plan with it anyway.",
                     robot_id,
                     robot_type,
                     UNPLANNABLE_ROBOT_TYPES[robot_type],
@@ -1610,6 +1774,7 @@ def _carry_prefix(dsg, graph, vertices, pose, held):
                 {
                     "object": obj,
                     "object_class": _semantic_label(dsg, obj),
+                    "dragged": is_heavy(dsg, obj),
                     "carry_path": np.zeros((0, 2)),
                     "dest_point": put_at,
                 }
@@ -1629,6 +1794,7 @@ def _carry_prefix(dsg, graph, vertices, pose, held):
             {
                 "object": obj,
                 "object_class": _semantic_label(dsg, obj),
+                "dragged": is_heavy(dsg, obj),
                 "carry_path": np.array(
                     [[by_id[i]["x"], by_id[i]["y"]] for i in path], dtype=float
                 ),
@@ -1688,7 +1854,7 @@ def _parameterize_tasks(
                 dsg, location_of.get(target, target)
             )
 
-        if kind in ("relocate", "place"):
+        if kind in _CARRY_KINDS + _DROP_KINDS:
             dest = destination_of.get(target)
             dest_point = (
                 _symbol_position_3d(dsg, location_of.get(dest, dest)) if dest else None
@@ -1697,9 +1863,9 @@ def _parameterize_tasks(
                 # No destination means "put it back where it was found", which
                 # needs neither a carry nor a second position.
                 pass
-            elif kind == "place":
-                # place-object is named after the object but happens at the
-                # destination, so that is where the robot sets it down.
+            elif kind in _DROP_KINDS:
+                # place-object (release-drag) is named after the object but
+                # happens at the destination, so that is where it is let go.
                 entry["object_point"] = dest_point
             else:
                 entry["dest_point"] = dest_point
@@ -1776,6 +1942,7 @@ def ground_problem(
         },
         region_visits=list(dict.fromkeys(s.lower() for s in goal.region_visits)),
         region_explores=list(dict.fromkeys(s.lower() for s in goal.region_explores)),
+        heavy_points=list(dict.fromkeys(s.lower() for s in (goal.heavy_points or []))),
         region_bound={
             kind: {
                 sym.lower(): list(dict.fromkeys(r.lower() for r in robots))
@@ -1784,6 +1951,15 @@ def ground_problem(
             for kind, targets in (goal.region_bound or {}).items()
         },
     )
+
+    # Heavy objects are dragged, not relocated: the same rule fast-downward's
+    # (heavy o) facts use (dsg_pddl.manipulation), applied to what is moved.
+    heavy = heavy_objects(dsg, goal.manipulate_points, goal.heavy_points)
+    goal = replace(
+        goal, heavy_points=[s for s in goal.manipulate_points if s in set(heavy)]
+    )
+    if goal.heavy_points:
+        logger.info("Heavy (dragged): %s", ", ".join(goal.heavy_points))
 
     pose = robot_states.get(goal.robot_id)
     if pose is None:
@@ -2020,7 +2196,11 @@ def ground_problem(
         "inspect-object": domain.inspect_duration_s,
         "pick-object": domain.pick_duration_s,
         "place-object": domain.place_duration_s,
+        "start-drag": domain.drag_start_duration_s,
+        "release-drag": domain.drag_release_duration_s,
     }
+    drag_start_s, drag_release_s = _drag_durations(durations)
+    heavy_set = set(goal.heavy_points or [])
     with open(os.path.join(scenario_dir, "domain.pddl"), "w") as fo:
         fo.write(render_domain_pddl(durations, domain.atomic_manipulation))
 
@@ -2033,6 +2213,11 @@ def ground_problem(
     # UAV can still manipulate.
     init_lines += [
         f"    (inspected {n})" for n in loc_names if n not in inspect_targets
+    ]
+    # Static weight class: relocate/pick/place need (light l), the drag
+    # actions (heavy l). Positive markers both, never a negated static.
+    init_lines += [
+        f"    ({'heavy' if n in heavy_set else 'light'} {n})" for n in loc_names
     ]
     init = "\n".join(init_lines)
 
@@ -2068,6 +2253,16 @@ def ground_problem(
         )
         for robot_id, _ in fleet
     }
+    # OMNIPLANNER_NO_ARM_ROBOTS takes the arm off a robot whatever its type
+    # says, as it does for fast-downward's (has-arm r).
+    no_arm = {
+        r.strip().lower()
+        for r in os.environ.get(NO_ARM_ROBOTS_ENV, "").split(",")
+        if r.strip()
+    }
+    for robot_id, kind in list(robot_species.items()):
+        if robot_id.lower() in no_arm and SPECIES[kind]["traits"][MANIP]:
+            robot_species[robot_id] = _species_without_arm(kind)
     logger.info(
         "Fleet: %s",
         ", ".join(f"{r}={s}" for r, s in sorted(robot_species.items())),
@@ -2194,6 +2389,37 @@ def ground_problem(
                     }
                 ]
             },
+            # Heavy objects: dragged, which needs an arm just as lifting does.
+            "drag-object": {
+                "subtasks": [
+                    {
+                        "role": "drag",
+                        "base_traits": _pad(_traits(MANIP), width),
+                        "duration": drag_start_s + drag_release_s,
+                        "location": "arg0",
+                    }
+                ]
+            },
+            "start-drag": {
+                "subtasks": [
+                    {
+                        "role": "start_drag",
+                        "base_traits": _pad(_traits(MANIP), width),
+                        "duration": drag_start_s,
+                        "location": "arg0",
+                    }
+                ]
+            },
+            "release-drag": {
+                "subtasks": [
+                    {
+                        "role": "release_drag",
+                        "base_traits": _pad(_traits(MANIP), width),
+                        "duration": drag_release_s,
+                        "location": "arg0",
+                    }
+                ]
+            },
         },
     }
     with open(os.path.join(scenario_dir, "action_trait_config.json"), "w") as fo:
@@ -2211,6 +2437,7 @@ def ground_problem(
             domain.atomic_manipulation,
             inspect_traits=requirement_traits(domain.inspect_requirement),
             identity=identity,
+            carry_extra_s=drag_carry_extra_s(goal, graph, vertex_of, robot_species),
         )
         if not tasks:
             raise ValueError("No tasks to allocate; nothing to plan for.")

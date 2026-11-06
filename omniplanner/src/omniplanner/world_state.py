@@ -10,7 +10,8 @@ produce alike:
 * a completed Follow visits every place and object near its waypoints (a path
   passes through them, as fast-downward's goto-poi does);
 * a successful Gaze inspects its object;
-* a successful Pick / Place picks up / puts down its object.
+* a successful Pick / Place picks up / puts down its object (and a
+  DRAG_START / DRAG_RELEASE grasps / lets go of a dragged one: holding).
 
 Holding is physical state, so the map is the authority when it tracks it (the
 heracles publisher puts it in the scene graph's metadata); the action reports
@@ -211,10 +212,12 @@ class WorldStateTracker:
             self.inspected.add(obj)
             if robot:
                 self.inspected_by.setdefault(robot, set()).add(obj)
-        elif action_type == "PICK" and obj:
+        elif action_type in ("PICK", "DRAG_START") and obj:
+            # A dragged object is in the robot's hand as much as a carried one:
+            # the planners tell the two apart by the object's weight class.
             self._reported_holding.setdefault(robot, set()).add(obj)
             new = {obj}
-        elif action_type == "PLACE" and obj:
+        elif action_type in ("PLACE", "DRAG_RELEASE") and obj:
             self._reported_holding.get(robot, set()).discard(obj)
             new = {obj}
         return new

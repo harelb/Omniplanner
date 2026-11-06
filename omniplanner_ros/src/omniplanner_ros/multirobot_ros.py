@@ -74,17 +74,34 @@ class MultiRobotPddlPlannerRos:
                 self.domain = MultiRobotPddlDomain(fo.read())
         # How much of the scene graph goes into the problem (see PddlConfig).
         self.domain.scene_scope = config.scene_scope
+        self._node = None
 
     def get_plan_callback(self):
         # TODO: topic name should depend on the config (i.e. what domain is specified)
         return PddlGoalMsg, "pddl_goal", self.pddl_callback
 
     def get_plugin_feedback(self, node):
+        self._node = node
         return None
+
+    def _robot_types(self):
+        """{robot_name -> robot_type} from the node's adaptors (omniplanner_plugins.yaml).
+
+        Grounding gives (has-arm r) only to robots whose type has an arm
+        (dsg_pddl.manipulation); without a node every robot keeps one.
+        """
+        adaptors = getattr(self._node, "robot_adaptors", None) or {}
+        return {
+            name: getattr(a, "robot_type", "") or "" for name, a in adaptors.items()
+        }
 
     def pddl_callback(self, msg, robot_poses):
         logger.info(f"Received PDDL goal {msg.pddl_goal} for robot {msg.robot_id}")
-        goal = PddlGoal(pddl_goal=msg.pddl_goal, robot_id=msg.robot_id)
+        goal = PddlGoal(
+            pddl_goal=msg.pddl_goal,
+            robot_id=msg.robot_id,
+            robot_types=self._robot_types(),
+        )
         robot_domain = self.domain
         req = PlanRequest(
             domain=robot_domain,
@@ -158,6 +175,7 @@ class MultiRobotPddlConstrainedPlannerRos(MultiRobotPddlPlannerRos):
             world_state=(
                 world_state_for(msg.goal.pddl_goal) if world_state_for else None
             ),
+            robot_types=self._robot_types(),
         )
         return PlanRequest(domain=self.domain, goal=goal, robot_states=robot_poses)
 
