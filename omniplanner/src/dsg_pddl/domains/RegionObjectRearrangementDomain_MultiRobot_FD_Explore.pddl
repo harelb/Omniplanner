@@ -115,14 +115,16 @@
                         (object-in-place ?o ?p))
      :effect (and (holding ?r ?o)
                   (hand-full ?r)
-                  (not (object-in-place ?o ?p))))
+                  (not (object-in-place ?o ?p))
+                  (increase (total-cost) 1)))
 
     (:action place-object
      :parameters (?r - robot ?o - dsg_object ?p - place)
      :precondition (and (holding ?r ?o) (at-place ?r ?p))
      :effect (and (not (holding ?r ?o))
                   (not (hand-full ?r))
-                  (object-in-place ?o ?p)))
+                  (object-in-place ?o ?p)
+                  (increase (total-cost) 1)))
 
     (:action start-drag
      :parameters (?r - robot ?o - dsg_object ?p - place)
@@ -134,13 +136,15 @@
                         (object-in-place ?o ?p))
      :effect (and (dragging ?r ?o)
                   (hand-full ?r)
-                  (not (object-in-place ?o ?p))))
+                  (not (object-in-place ?o ?p))
+                  (increase (total-cost) 1)))
 
     (:action release-drag
      :parameters (?r - robot ?o - dsg_object ?p - place)
      :precondition (and (dragging ?r ?o) (at-place ?r ?p))
      :effect (and (not (dragging ?r ?o))
                   (not (hand-full ?r))
-                  (object-in-place ?o ?p)))
+                  (object-in-place ?o ?p)
+                  (increase (total-cost) 1)))
 
 )
