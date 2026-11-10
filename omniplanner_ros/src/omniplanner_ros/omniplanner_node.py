@@ -137,6 +137,25 @@ def evaluate_dispatch_guards(
     return True, None
 
 
+# Dispatch-guard refusals that leave a robot out of PLANNING, not only dispatch:
+# a robot that cannot move must not be given work, or a multi-robot goal is
+# assigned to it and then refused at dispatch every replan. A lease the robot
+# does not hold is not one of them: an operator send takes the lease just before
+# the goal, so it is still checked only when the plan is dispatched.
+PLANNING_EXCLUDED_PREFIXES = ("estop_pressed", "not_powered", "battery_below_min")
+
+
+def planning_exclusion(guards, guards_age_s, *, min_battery_percent=10.0):
+    """The reason a robot is left out of planning, or None (same fail-open
+    rules as :func:`evaluate_dispatch_guards`)."""
+    ok, reason = evaluate_dispatch_guards(
+        guards, guards_age_s, min_battery_percent=min_battery_percent
+    )
+    if ok or not reason:
+        return None
+    return reason if reason.startswith(PLANNING_EXCLUDED_PREFIXES) else None
+
+
 def format_refusals(refusals):
     """{robot: refusal reason} -> the plan_status error of a fully refused plan."""
     reason = "plan refused by runtime dispatch guards"
@@ -223,12 +242,21 @@ class RobotPlanningAdaptor:
             self.ros_logger.warning(str(e))
             return None
 
+    def guards_age_s(self):
+        if self.last_guards_stamp_s is None:
+            return None
+        return self._node_clock.now().nanoseconds / 1e9 - self.last_guards_stamp_s
+
+    def planning_exclusion(self):
+        """Why this robot is left out of planning right now (None: plannable)."""
+        return planning_exclusion(
+            self.last_guards, self.guards_age_s(), min_battery_percent=self.min_battery_percent
+        )
+
     def publish_plan(self, plan):
         """Dispatch a compiled plan, gated by the latest runtime guards
         (PR B8). Returns (published: bool, refusal_reason: str | None)."""
-        age_s = None
-        if self.last_guards_stamp_s is not None:
-            age_s = self._node_clock.now().nanoseconds / 1e9 - self.last_guards_stamp_s
+        age_s = self.guards_age_s()
         ok, reason = evaluate_dispatch_guards(
             self.last_guards, age_s, min_battery_percent=self.min_battery_percent
         )
@@ -341,14 +369,22 @@ class LazyRobotPoses(Mapping):
         self._parent_frame = parent_frame
         self._timeout_s = timeout_s
         self._cache = {}
+        self.excluded = {}  # robot -> runtime-guard reason it was left out of planning
 
     def __getitem__(self, name):
         if name not in self._adaptors:
             raise KeyError(name)
         if name not in self._cache:
-            self._cache[name] = self._adaptors[name].get_pose(
-                self._parent_frame, self._timeout_s
-            )
+            adaptor = self._adaptors[name]
+            check = getattr(adaptor, "planning_exclusion", None)
+            why = check() if callable(check) else None
+            if why:
+                # treated like an offline robot: the grounders skip pose None
+                adaptor.ros_logger.warning(f"[{name}] left out of planning: {why}")
+                self.excluded[name] = why
+                self._cache[name] = None
+            else:
+                self._cache[name] = adaptor.get_pose(self._parent_frame, self._timeout_s)
         return self._cache[name]
 
     def __iter__(self):
