@@ -1961,12 +1961,6 @@ def ground_problem(
     if goal.heavy_points:
         logger.info("Heavy (dragged): %s", ", ".join(goal.heavy_points))
 
-    pose = robot_states.get(goal.robot_id)
-    if pose is None:
-        raise ValueError(
-            f"No pose for robot {goal.robot_id}; cannot place its start vertex."
-        )
-
     graph, vertices, _, symbol_of_vertex = _mesh_place_graph(dsg)
     if not vertices:
         raise ValueError("DSG has no mesh-places layer; nothing to build a graph from.")
