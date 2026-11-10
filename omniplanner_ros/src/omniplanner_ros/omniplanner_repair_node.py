@@ -411,7 +411,8 @@ class OmniPlannerRepairRos(OmniPlannerRos):
             self._route = route_places(
                 plan_dict, self._place_finder(self._current_dsg())
             )
-            self._plan_ids = {r: p.plan_id for r, p in plan_dict.items()}
+            # a phoenix (husky) plan is a nav_msgs/Path, which has no plan_id
+            self._plan_ids = {r: getattr(p, "plan_id", "") for r, p in plan_dict.items()}
             self._actions_done = {}
             self._route_version = self._map_version()
         for robot in self._plan_robots:
@@ -427,7 +428,7 @@ class OmniPlannerRepairRos(OmniPlannerRos):
         release, self._pending_release = self._pending_release, {}
         if not release:
             return plan_dict
-        plan_id = next((p.plan_id for p in plan_dict.values()), "")
+        plan_id = next((p.plan_id for p in plan_dict.values() if getattr(p, "plan_id", "")), "")
         for robot, objects in release.items():
             name = next((n for n in self.robot_adaptors if n.lower() == robot), robot)
             pose = robot_poses.get(name)
