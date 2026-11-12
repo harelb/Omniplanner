@@ -78,6 +78,12 @@ from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from robot_executor_msgs.msg import ActionDoneMsg, ActionSequenceMsg
 from std_msgs.msg import Bool, Int64, String
 
+from omniplanner_ros.eventlog_ros import (
+    constraints_to_list,
+    lazy_event_log,
+    make_event_log,
+)
+
 # Goal-side predicates we treat as "must visit".
 # Region goals (visited-region, explored-region and their -by forms) are
 # deliberately NOT here: whether a region is done depends on which of its places
@@ -607,6 +613,13 @@ class GoalManager(Node):
             self.get_parameter("stale_pause_window_s").value or 0.0
         )
 
+        # events/goal_manager.jsonl in the run dir (off without ADT4_RUN_DIR)
+        self.events = make_event_log(self, "goal_manager")
+        # The robots' plans when the pending goal was sent, and the last
+        # robot states logged: for repair.decision and gm.robot_state diffs.
+        self._plans_before: Dict[str, str] = {}
+        self._logged_states: dict = {}
+
         # Subscriptions (private; remap at launch time).
         self._goal_sub = self.create_subscription(
             ConstrainedPddlGoalMsg, "~/commanded_goal", self._commanded_goal_cb, 10
@@ -813,6 +826,11 @@ class GoalManager(Node):
             if now < at:
                 continue
             self._executor_cmd(robot, "resume")
+            self._log_event(
+                "resume",
+                {"robot": robot, "reason": "a stale pause may still arrive"},
+                plan_id=plan_id,
+            )
             if now >= until:
                 self._unpause.pop(robot, None)
             else:
@@ -952,6 +970,19 @@ class GoalManager(Node):
             self._robots.pop(robot)
             self._plan_robots.discard(robot)
         self._log_robot(robot, entry, why)
+        if status == STALLED:
+            self._log_event(
+                "progress.stall",
+                {
+                    "robot": robot,
+                    "plan_id": entry.plan_id,
+                    "why": why,
+                    "done": entry.done,
+                    "total": entry.total,
+                    "open_again": open_again,
+                },
+                plan_id=entry.plan_id,
+            )
         if status in (FAILED, STALLED):
             part = (
                 f" Its part of the goal, {' '.join(open_again)}, is open again and "
@@ -1007,7 +1038,9 @@ class GoalManager(Node):
         }
 
     def _publish_states(self) -> None:
-        self._states_pub.publish(String(data=json.dumps(self._robot_states())))
+        states = self._robot_states()
+        self._log_state_changes(states)
+        self._states_pub.publish(String(data=json.dumps(states)))
 
     def _running(self) -> Dict[str, RobotPlan]:
         """Robots executing their plan: a Spot reporting its actions, or a
@@ -1043,7 +1076,11 @@ class GoalManager(Node):
         left_out = self._paused - robots
         for robot in sorted(left_out):
             self.get_logger().info(f"{robot} is not in the new plan; stopping it")
-            self._executor_cmd(robot, "stop")
+            reached = self._executor_cmd(robot, "stop")
+            self._log_event(
+                "stop",
+                {"robot": robot, "reason": "not in the new plan", "reached": reached},
+            )
             self._drop(robot, "stopped: not in the new plan")
         self._paused = set()
         self._last_listed = set(robots)
@@ -1063,6 +1100,7 @@ class GoalManager(Node):
                 self._robots[robot] = entry
                 self._log_robot(robot, entry, "got a new plan (a Path)")
         if pending is not None:
+            self._log_plan_decision(pending, robots, left_out)
             self._commit_plan(pending, robots)
 
     def _commit_plan(self, pending: Pending, robots: Set[str]) -> None:
@@ -1152,6 +1190,9 @@ class GoalManager(Node):
         self._lost = set()
         self._plan_finish_times = {}
         self._publish_states()
+        self._log_event(
+            "gm.map_reload", {"why": why, "epoch": self._map_epoch, "robots": robots}
+        )
         self._notify_operator(
             f"The map was reloaded ({why}). Forgetting what was done and what "
             f"{_names(robots) or 'the robots'} were doing; the next goal is "
@@ -1178,6 +1219,7 @@ class GoalManager(Node):
         why = msg.data.split(": ", 1)[-1]  # drop the plugin name
         holds = "already satisfied" in why.lower()
         goal = self._pending_goal
+        self._log_failed_decision(self._pending, why, holds)
         pending, self._pending = self._pending, None
         target = self._describe(goal)
         if holds and pending is not None:
@@ -1199,7 +1241,9 @@ class GoalManager(Node):
             return
         if self._replan_reason is not None:
             reason, self._replan_reason = self._replan_reason, None
-            stopped = self._stop_summary(*self._stop_executor())
+            stopped = self._stop_summary(
+                *self._stop_executor(reason=f"replan failed after {reason}")
+            )
             if holds:
                 self._notify_operator(
                     f"Replanned after {reason}: {target} already holds, nothing "
@@ -1222,10 +1266,10 @@ class GoalManager(Node):
         )
         same_map = getattr(self, "_running_epoch", 0) == getattr(self, "_map_epoch", 0)
         if same_constraints and same_map and getattr(self, "_resume_on_failure", False):
-            self._resume_executor()
+            self._resume_executor(reason="the goal failed: continuing the plan")
             self._notify_operator(f"{lead}. Continuing the current plan.")
             return
-        stopped = self._stop_summary(*self._stop_executor())
+        stopped = self._stop_summary(*self._stop_executor(reason=f"no plan: {why}"))
         if not same_constraints:
             self._notify_operator(
                 f"{lead}. {stopped}: the current plan was made without these "
@@ -1262,13 +1306,25 @@ class GoalManager(Node):
                 c for c in goal.constraints if c.predicate != USE_ROBOTS
             ]
             goal = stripped
+        self._log_event(
+            "repair.trigger",
+            {
+                "reason": msg.data,
+                "map_version": self._map_version,
+                "epoch": self._map_epoch,
+                "epoch_id": self._map_epoch_id,
+                "todo": todo,
+                "replanning": bool(todo),
+            },
+        )
         if not todo:
             self.get_logger().info(
                 f"replan requested ({msg.data}), but every conjunct of the "
                 f"mission is achieved: {mission}"
             )
             return
-        self._pause_executor()
+        self._plans_before = self._current_plans()
+        self._pause_executor(reason=f"replan: {msg.data}")
         self._replan_reason = msg.data
         out = self._goal_msg(goal, todo, [])
         self._pending = Pending(REPAIR, out, todo, self._stamp, self._now())
@@ -1279,6 +1335,7 @@ class GoalManager(Node):
 
     def _notify_operator(self, text: str) -> None:
         self.get_logger().warning(f"operator: {text}")
+        self._log_event("gm.alert", {"text": text})
         self._display_pub.publish(String(data=text))
         self._alert_pub.publish(String(data=text))
 
@@ -1322,6 +1379,7 @@ class GoalManager(Node):
         decision = self._decide(msg)
         decision.new_mission = new_mission and decision.action in (REPAIR, SCOPED)
         self._log_decision(msg, decision)
+        self._log_goal(msg, decision)
         if decision.action in (SKIP, WAIT):
             self._notify_operator(f"{self._describe(msg)}: {decision.reason}.")
             return
@@ -1621,7 +1679,7 @@ class GoalManager(Node):
             pub.publish(Bool(data=True))
         return pub.get_subscription_count() > 0
 
-    def _pause_executor(self, only=None) -> None:
+    def _pause_executor(self, only=None, reason: str = "") -> None:
         """Pause every robot of the running plan (or those of them in only);
         an idle one ignores it."""
         robots = self._plan_robots - {self._base_station}
@@ -1634,8 +1692,10 @@ class GoalManager(Node):
             if r in huskies:
                 continue
             self._note_pause(r, own=True)
-            if not self._executor_cmd(r, "pause"):
+            reached = self._executor_cmd(r, "pause")
+            if not reached:
                 unreached.append(r)
+            self._log_event("pause", {"robot": r, "reason": reason, "reached": reached})
         if huskies:
             self.get_logger().warning(
                 f"Pause is not supported on a Husky: {_names(huskies)} keep driving "
@@ -1645,20 +1705,25 @@ class GoalManager(Node):
             self.get_logger().warning(f"Could not reach {_names(unreached)} to pause")
         self._paused |= set(robots)
 
-    def _resume_executor(self) -> None:
+    def _resume_executor(self, reason: str = "") -> None:
         now = self._now()
         for robot in sorted(self._paused):
             if self._platform(robot) != HUSKY:
                 self._executor_cmd(robot, "resume")
+                self._log_event("resume", {"robot": robot, "reason": reason})
             if robot in self._robots:
                 self._robots[robot].since = now  # paused time is not a stall
         self._paused = set()
 
-    def _stop_executor(self):
+    def _stop_executor(self, reason: str = ""):
         """Stop every paused robot. Returns (stopped, unreached)."""
         stopped, unreached = [], []
         for robot in sorted(self._paused):
-            (stopped if self._executor_cmd(robot, "stop") else unreached).append(robot)
+            reached = self._executor_cmd(robot, "stop")
+            (stopped if reached else unreached).append(robot)
+            self._log_event(
+                "stop", {"robot": robot, "reason": reason, "reached": reached}
+            )
             self._drop(robot, "stopped")
         self._paused = set()
         return stopped, unreached
@@ -1706,6 +1771,7 @@ class GoalManager(Node):
         return out
 
     def _forward_for_replanning(self, msg: ConstrainedPddlGoalMsg, d: Decision) -> None:
+        self._plans_before = self._current_plans()
         if d.action == REPAIR:
             mid = self.robots_mid_task()
             if mid:
@@ -1717,7 +1783,7 @@ class GoalManager(Node):
                         for r, e in sorted(mid.items())
                     )
                 )
-            self._pause_executor()
+            self._pause_executor(reason=f"new goal (repair): {d.reason}")
         elif d.action == SCOPED:
             mid = {r: e for r, e in self.robots_mid_task().items() if r in d.robots}
             if mid:
@@ -1729,7 +1795,9 @@ class GoalManager(Node):
                         for r, e in sorted(mid.items())
                     )
                 )
-            self._pause_executor(only=d.robots)
+            self._pause_executor(
+                only=d.robots, reason=f"new goal (robot-scoped): {d.reason}"
+            )
         out = self._goal_msg(msg, d.todo, d.busy, d.new_mission, d.robots)
         # Record what the incoming plan will be grounded under, so the next goal
         # can tell whether the constraints have since changed.
@@ -1785,6 +1853,128 @@ class GoalManager(Node):
                 else ""
             )
         )
+
+    # ------------- event log (never raises into the goal manager) -------------
+
+    def _log_event(self, type, payload=None, **ids) -> None:
+        try:
+            lazy_event_log(self, "events", "goal_manager").emit(type, payload, **ids)
+        except Exception:
+            pass
+
+    def _current_plans(self) -> Dict[str, str]:
+        """{robot -> plan_id} of the robots executing (or stalled on) a plan."""
+        return {
+            r: e.plan_id
+            for r, e in sorted(self._robots.items())
+            if e.status in (RUNNING, STALLED)
+        }
+
+    def _log_goal(self, msg, d: Decision) -> None:
+        try:
+            self._log_event(
+                "gm.goal",
+                {
+                    "commanded": {
+                        "robot_id": msg.goal.robot_id,
+                        "pddl_goal": msg.goal.pddl_goal,
+                        "constraints": constraints_to_list(msg.constraints),
+                    },
+                    "decision": d.action,
+                    "reason": d.reason,
+                    "scope": "robots" if d.action == SCOPED else "team",
+                    "scoped_robots": list(d.robots),
+                    "todo": list(d.todo),
+                    "busy": list(d.busy),
+                    "new_mission": d.new_mission,
+                    "conflicts": dict(d.conflicts),
+                    "dropped": list(d.dropped),
+                    "classes": {c: list(v) for c, v in d.classes.items()},
+                    "forwarded": d.action in (REPAIR, ADDITIONAL, SCOPED),
+                    "map": list(self._stamp),
+                },
+            )
+        except Exception:
+            pass
+
+    def _log_state_changes(self, states: dict) -> None:
+        """gm.robot_state for each robot whose state changed since logged."""
+        try:
+            before = getattr(self, "_logged_states", None) or {}
+            for robot in sorted(set(before) | set(states)):
+                now = states.get(robot)
+                if now == before.get(robot):
+                    continue
+                payload = {"robot": robot, "state": now}
+                if now is None:
+                    payload["cleared"] = True
+                    payload["was"] = before.get(robot)
+                self._log_event(
+                    "gm.robot_state",
+                    payload,
+                    plan_id=(now or before.get(robot) or {}).get("plan_id", ""),
+                )
+            self._logged_states = json.loads(json.dumps(states))
+        except Exception:
+            pass
+
+    def _log_plan_decision(self, pending: Pending, robots, left_out) -> None:
+        """The plan for the pending goal arrived: who was replanned, who kept
+        their plan, who was dropped."""
+        try:
+            old = dict(getattr(self, "_plans_before", {}) or {})
+            new = {
+                r: self._robots[r].plan_id
+                for r in sorted(robots)
+                if r in self._robots and self._robots[r].plan_id
+            }
+            replanned = sorted(robots)
+            dropped = sorted(left_out)
+            kept = sorted(set(old) - set(replanned) - set(dropped))
+            self._log_event(
+                "repair.decision",
+                {
+                    "outcome": "planned",
+                    "kind": pending.kind,
+                    "trigger": self._replan_reason or "goal",
+                    "goal": pending.msg.goal.pddl_goal,
+                    "conjuncts": list(pending.conjuncts),
+                    "replanned": replanned,
+                    "kept": kept,
+                    "dropped": dropped,
+                    "dropped_conjuncts": list(pending.dropped),
+                    "old_plan": old,
+                    "new_plan": new,
+                    "map": list(pending.stamp),
+                },
+                plan_id=next(iter(new.values()), ""),
+            )
+            self._plans_before = {}
+        except Exception:
+            pass
+
+    def _log_failed_decision(self, pending, why: str, holds: bool) -> None:
+        try:
+            self._log_event(
+                "repair.decision",
+                {
+                    "outcome": "satisfied" if holds else "failed",
+                    "kind": pending.kind if pending is not None else "",
+                    "trigger": self._replan_reason or "goal",
+                    "error": why,
+                    "goal": pending.msg.goal.pddl_goal if pending is not None else "",
+                    "conjuncts": list(pending.conjuncts) if pending else [],
+                    "paused": sorted(self._paused),
+                    "old_plan": dict(getattr(self, "_plans_before", {}) or {}),
+                    "new_plan": {},
+                    "resume_on_plan_failure": bool(
+                        getattr(self, "_resume_on_failure", False)
+                    ),
+                },
+            )
+            self._plans_before = {}
+        except Exception:
+            pass
 
 
 def main(args=None):

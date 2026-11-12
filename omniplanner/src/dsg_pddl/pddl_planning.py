@@ -9,9 +9,11 @@ import time
 import uuid
 from datetime import datetime
 
+from dsg_pddl.dump_files import env_dump_dir, point_latest, run_dump_dir
 from dsg_pddl.grounding_errors import error_for_fd_returncode
 from dsg_pddl.pddl_grounding import GroundedPddlProblem
 from dsg_pddl.pddl_utils import lisp_string_to_ast
+from omniplanner import solve_stats
 
 logger = logging.getLogger(__name__)
 
@@ -165,17 +167,25 @@ def failure_reason(returncode: int, problem: GroundedPddlProblem) -> str:
 def resolve_dump_dir():
     """Directory where the debug domain/problem/plan PDDL dumps are written.
 
-    Defaults to ~/adt4_output/omniplanner/; override with the
-    OMNIPLANNER_DUMP_DIR env var. Created if it doesn't already exist.
+    OMNIPLANNER_DUMP_DIR if set, else $ADT4_RUN_DIR/omniplanner (run-adt4's
+    run dir), else ~/adt4_output/omniplanner/. Created if it doesn't already
+    exist.
     """
-    dump_dir = os.environ.get("OMNIPLANNER_DUMP_DIR")
-    dump_dir = (
-        os.path.expanduser(dump_dir)
-        if dump_dir
-        else os.path.expanduser("~/adt4_output/omniplanner")
+    dump_dir = env_dump_dir("OMNIPLANNER_DUMP_DIR") or os.path.expanduser(
+        "~/adt4_output/omniplanner"
     )
     os.makedirs(dump_dir, exist_ok=True)
     return dump_dir
+
+
+def failed_problem_path(dump_dir, stamp):
+    """Where the problem of a failed solve is written:
+    pddl_problem_debugging_<stamp>.pddl, in the solve dump directory when
+    run-adt4 set a run dir ($ADT4_RUN_DIR), else in $ADT4_OUTPUT_DIR (or the
+    cwd), as before. pddl_problem_debugging_latest.pddl links to the newest."""
+    if run_dump_dir() is None:
+        dump_dir = os.getenv("ADT4_OUTPUT_DIR", "")
+    return os.path.join(dump_dir, f"pddl_problem_debugging_{stamp}.pddl")
 
 
 def solve_pddl(problem: GroundedPddlProblem):
@@ -197,6 +207,7 @@ def solve_pddl(problem: GroundedPddlProblem):
         now = datetime.now()
         key = str(uuid.uuid4())[:8]
         formatted_str = now.strftime("%Y-%m-%d_%H_%M_%S")
+        solve_start = time.perf_counter()
 
         dump_dir = resolve_dump_dir()
 
@@ -326,8 +337,7 @@ def solve_pddl(problem: GroundedPddlProblem):
             with open(debug_plan_fn, "w") as fo:
                 fo.writelines(lines)
         else:
-            output_dir = os.getenv("ADT4_OUTPUT_DIR", "")
-            debug_fn = os.path.join(output_dir, "pddl_problem_debugging.pddl")
+            debug_fn = failed_problem_path(dump_dir, f"{formatted_str}_{key}")
             logger.warning(
                 f"Planning failed. Please see {debug_fn} for the failed problem file."
             )
@@ -336,6 +346,12 @@ def solve_pddl(problem: GroundedPddlProblem):
             try:
                 with open(debug_fn, "w") as fo:
                     fo.write(problem.problem_str)
+                point_latest(
+                    os.path.join(
+                        os.path.dirname(debug_fn), "pddl_problem_debugging_latest.pddl"
+                    ),
+                    debug_fn,
+                )
             except OSError as e:
                 # An unwritable dump path must not mask the real failure with
                 # an OSError -- callers triage on the typed error below.
@@ -358,13 +374,29 @@ def solve_pddl(problem: GroundedPddlProblem):
             err.fd_digest = digest
             err.fd_log = _log_tail(output)
             err.problem_file = debug_problem_fn
+            solve_stats.record(
+                "FD",
+                ok=False,
+                seconds=round(time.perf_counter() - fd_start, 3),
+                returncode=proc.returncode,
+                digest=digest,
+                problem_file=debug_problem_fn,
+                domain_file=debug_domain_fn,
+                failed_problem_file=debug_fn,
+            )
             raise err
         # what the search did, for callers that report it
         problem.fd_stats = {
             "seconds": round(time.perf_counter() - fd_start, 3),
             "plans": len(glob.glob(plan_fn + ".*")) or 1,
             "digest": fd_digest((proc.stdout or "") + (proc.stderr or "")),
+            # with writing the problem and domain files
+            "solve_s": round(time.perf_counter() - solve_start, 3),
+            "problem_file": debug_problem_fn,
+            "domain_file": debug_domain_fn,
+            "plan_file": debug_plan_fn,
         }
+        solve_stats.record("FD", ok=True, **problem.fd_stats)
 
     plan = [lisp_string_to_ast(line) for line in lines[:-1]]
     return plan

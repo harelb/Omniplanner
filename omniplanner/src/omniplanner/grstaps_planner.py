@@ -28,6 +28,7 @@ from dsg_pddl.dsg_pddl_grounding_multirobot import (
 from dsg_pddl.pddl_utils import lisp_string_to_ast
 from plum import dispatch
 
+from omniplanner import solve_stats
 from omniplanner.omniplanner import (
     MultiRobotWrapper,
     PlanningDomain,
@@ -2959,9 +2960,11 @@ def _check_holders(holders, agents, by_id):
 @dispatch
 def make_plan(problem: GroundedGrstapsProblem, map_context: Any) -> GrstapsPlan:
     if problem.nothing_to_solve:
+        solve_stats.record("GRSTAPS", ok=True, seconds=0.0, makespan=0.0, solved=False)
         return GrstapsPlan(
             makespan=0.0, tasks=[], prefix=problem.prefix, region_of=problem.region_of
         )
+    solve_start = time.perf_counter()
     if problem.domain.entry == "itags":
         result, solution_file = _run_itags(problem)
     else:
@@ -2971,7 +2974,18 @@ def make_plan(problem: GroundedGrstapsProblem, map_context: Any) -> GrstapsPlan:
 
         result = _run_solver(problem)
         solution_file = os.path.join(solution_dir, "itags_files", "itags_solution.json")
+    # the solver's own time, for the planner's event log (omniplanner.solve_stats)
+    solve_s = round(time.perf_counter() - solve_start, 3)
+    stats = {
+        "seconds": solve_s,
+        "entry": problem.domain.entry,
+        "run_mode": getattr(problem.domain, "run_mode", ""),
+        "returncode": getattr(result, "returncode", None),
+        "scenario_dir": getattr(problem, "scenario_dir", ""),
+        "solution_file": solution_file,
+    }
     if not os.path.exists(solution_file):
+        solve_stats.record("GRSTAPS", ok=False, **stats)
         # The solver logs to stdout, not stderr, and reports licensing problems
         # only there -- surface the real reason rather than an empty stderr.
         combined = (result.stdout or "") + (result.stderr or "")
@@ -3014,6 +3028,14 @@ def make_plan(problem: GroundedGrstapsProblem, map_context: Any) -> GrstapsPlan:
     makespan = float(solution.get("makespan", 0.0))
     tasks = solution.get("tasks", [])
     agents = solution.get("agents", [])
+    solve_stats.record(
+        "GRSTAPS",
+        ok=True,
+        makespan=makespan,
+        n_tasks=len(tasks),
+        n_agents=len(agents),
+        **stats,
+    )
     logger.info(
         "GRSTAPS-X solved: makespan=%.3f, %d task(s), %d agent(s)",
         makespan,

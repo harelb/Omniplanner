@@ -19,6 +19,7 @@ from dsg_pddl.pddl_planning import resolve_dump_dir  # noqa: E402
 
 def test_resolve_dump_dir_default(tmp_path, monkeypatch):
     monkeypatch.delenv("OMNIPLANNER_DUMP_DIR", raising=False)
+    monkeypatch.delenv("ADT4_RUN_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
 
     result = resolve_dump_dir()

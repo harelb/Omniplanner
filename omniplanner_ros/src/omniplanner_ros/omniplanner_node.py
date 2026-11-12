@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ import tf2_ros
 import tf_transformations
 from hydra_msgs.msg import DsgUpdate
 from nav_msgs.msg import Path
+from omniplanner import solve_stats
 from omniplanner.compile_plan import collect_plans, compile_plan
 from omniplanner.omniplanner import full_planning_pipeline
 from rclpy.callback_groups import (
@@ -37,6 +39,13 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from visualization_msgs.msg import MarkerArray
 
+from omniplanner_ros import plan_summary
+from omniplanner_ros.eventlog_ros import (
+    constraints_to_list,
+    lazy_event_log,
+    make_event_log,
+    msg_to_dict,
+)
 from omniplanner_ros.ros_logging import setup_ros_log_forwarding
 
 try:
@@ -264,6 +273,56 @@ def get_robot_pose(tf_buffer, parent_frame: str, child_frame: str) -> np.ndarray
     )
 
 
+def file_ref(path):
+    """{"$file": path} for the event log, relative to $ADT4_RUN_DIR when the
+    file is in it; None for no file."""
+    if not path:
+        return None
+    run_dir = os.environ.get("ADT4_RUN_DIR", "").strip()
+    if run_dir:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(run_dir))
+        if not rel.startswith(".."):
+            return {"$file": rel}
+    return {"$file": os.path.abspath(path)}
+
+
+# Which solver a planner plugin runs, by its class name.
+_ENGINES = (
+    ("grstaps", "GRSTAPS"),
+    ("language", "language"),
+    ("tsp", "TSP"),
+    ("gotopoints", "goto_points"),
+    ("pddl", "FD"),
+)
+
+
+def engine_of(plugin, records=()) -> str:
+    """FD, GRSTAPS, TSP, language, goto_points: the plugin's planner. A plugin
+    of no known kind is named by the solver that recorded a call, else by its
+    class."""
+    name = type(plugin).__name__.lower().replace("_", "")
+    for key, engine in _ENGINES:
+        if key in name:
+            return engine
+    for r in records:
+        if r.get("engine"):
+            return r["engine"]
+    return type(plugin).__name__
+
+
+def pddl_file(records, files, failed=False):
+    """The problem file a plan (or a failure) is about, for the event log."""
+    for r in reversed(records):
+        path = (r.get("failed_problem_file") if failed else None) or r.get(
+            "problem_file"
+        )
+        if path:
+            return path
+        if r.get("scenario_dir"):
+            return os.path.join(r["scenario_dir"], "problem.pddl")
+    return files.get("mr_region_problem", "")
+
+
 def plan_is_empty(plan) -> bool:
     """An ActionSequence with no actions, or a Path with no poses."""
     steps = getattr(plan, "actions", None)
@@ -351,6 +410,9 @@ class OmniPlannerRos(Node):
         self.declare_parameter("max_pose_age_s", 5.0)
         self._max_pose_age_s = float(self.get_parameter("max_pose_age_s").value)
         self._pose_status: Dict[str, str] = {}
+
+        # events/omniplanner.jsonl in the run dir (off without ADT4_RUN_DIR)
+        self.events = make_event_log(self, "omniplanner")
 
         self.heartbeat_pub = self.create_publisher(NodeInfoMsg, "~/node_status", 1)
         heartbeat_timer_group = MutuallyExclusiveCallbackGroup()
@@ -501,6 +563,104 @@ class OmniPlannerRos(Node):
         }
         self.plan_status_pub.publish(String(data=json.dumps(status)))
 
+    # ------------- event log (never raises into planning) -------------
+
+    def _events(self):
+        return lazy_event_log(self, "events", "omniplanner")
+
+    def log_event(self, type, payload=None, **ids) -> None:
+        try:
+            self._events().emit(type, payload, **ids)
+        except Exception:
+            pass
+
+    def _log_plan_request(self, name, plugin, msg, robot_poses, request) -> None:
+        try:
+            goal = msg_to_dict(msg)
+            robots = sorted(r for r, p in (robot_poses or {}).items() if p is not None)
+            self.log_event(
+                "plan.request",
+                {
+                    "request": request,
+                    "plugin": name,
+                    "engine": engine_of(plugin),
+                    "goal": goal,
+                    "robot_id": getattr(msg, "robot_id", "")
+                    or getattr(getattr(msg, "goal", None), "robot_id", "")
+                    or "",
+                    "robots": robots,
+                    "robots_without_pose": sorted(
+                        r for r, p in (robot_poses or {}).items() if p is None
+                    ),
+                    "constraints": constraints_to_list(getattr(msg, "constraints", [])),
+                    "persistent_constraints": constraints_to_list(
+                        getattr(self, "active_constraints", [])
+                    ),
+                },
+            )
+        except Exception:
+            pass
+
+    def _log_plan_failed(
+        self,
+        name,
+        plugin,
+        request,
+        error,
+        records=(),
+        files=None,
+        solve_s=None,
+        **extra,
+    ) -> None:
+        try:
+            files = files or {}
+            payload = {
+                "request": request,
+                "plugin": name,
+                "engine": engine_of(plugin, records),
+                "error": error,
+                "solve_s": solve_s,
+                "solver": list(records),
+                **extra,
+            }
+            problem = pddl_file(records, files, failed=True)
+            if problem:
+                payload["pddl"] = file_ref(problem)
+            self.log_event("plan.failed", payload)
+        except Exception:
+            pass
+
+    def _log_plan_solved(
+        self, name, plugin, request, plan_dict, records, files, solve_s
+    ) -> None:
+        try:
+            summary = plan_summary.summarize(plan_dict)
+            makespan = next(
+                (r["makespan"] for r in reversed(records) if "makespan" in r), None
+            )
+            payload = {
+                "request": request,
+                "plugin": name,
+                "plan_id": plan_summary.shared_plan_id(plan_dict),
+                "engine": engine_of(plugin, records),
+                "solve_s": solve_s,
+                "solver_s": round(sum(r.get("seconds") or 0.0 for r in records), 3)
+                if records
+                else None,
+                "makespan": makespan,
+                "robots": sorted(plan_dict),
+                **summary,
+                "solver": list(records),
+            }
+            problem = pddl_file(records, files)
+            if problem:
+                payload["pddl"] = file_ref(problem)
+            if files:
+                payload["files"] = {k: file_ref(v) for k, v in files.items()}
+            self.log_event("plan.solved", payload, plan_id=payload["plan_id"])
+        except Exception:
+            pass
+
     def register_plugin(self, name, plugin):
         self.get_logger().info(f"Registering subscription plugin {name}")
         msg_type, topic, callback = plugin.get_plan_callback()
@@ -513,21 +673,31 @@ class OmniPlannerRos(Node):
                 self.goal_count += 1
                 number = self.goal_count
             with self.planning_lock:
-                plan_goal(msg, superseded=lambda: number != self.goal_count)
+                plan_goal(
+                    msg, superseded=lambda: number != self.goal_count, request=number
+                )
 
         def done_planning():
             with self.current_planner_lock, self.plan_time_start_lock:
                 self.current_planner = None
                 self.plan_time_start = None
 
-        def plan_goal(msg, superseded):
+        def plan_goal(msg, superseded, request=0):
             self.get_logger().info(f"Handling plan for plugin {name}")
             if superseded():
                 self.get_logger().info(f"Skipping a superseded {name} goal")
+                self.log_event(
+                    "plan.superseded",
+                    {"request": request, "plugin": name, "stage": "before planning"},
+                )
                 return
 
             if self.dsg_last is None:
                 self.get_logger().error("Got plan request, but no DSG!")
+                self._log_plan_request(name, plugin, msg, {}, request)
+                self._log_plan_failed(
+                    name, plugin, request, "no scene graph received yet"
+                )
                 self.publish_plan_status(
                     name, msg, False, "no scene graph received yet"
                 )
@@ -539,7 +709,10 @@ class OmniPlannerRos(Node):
 
             robot_poses = self.get_robot_poses(self.dsg_frame)
             self.get_logger().info(f"Planning with robot poses {robot_poses}")
+            self._log_plan_request(name, plugin, msg, robot_poses, request)
 
+            solve_stats.start()
+            solve_start = time.perf_counter()
             try:
                 plan_request = callback(msg, robot_poses)
                 with self.dsg_lock:
@@ -568,6 +741,18 @@ class OmniPlannerRos(Node):
                 self.get_logger().error(
                     f"Planning failed for plugin {name}, keeping the node alive: {exc}"
                 )
+                records, files = solve_stats.finish()
+                self._log_plan_failed(
+                    name,
+                    plugin,
+                    request,
+                    str(exc),
+                    records,
+                    files,
+                    round(time.perf_counter() - solve_start, 3),
+                    error_type=type(exc).__name__,
+                    superseded=superseded(),
+                )
                 # Otherwise the node reports itself as planning for ever and the
                 # status monitor never recovers.
                 done_planning()
@@ -577,9 +762,20 @@ class OmniPlannerRos(Node):
                     self.publish_plan_status(name, msg, False, str(exc))
                 return
 
+            solve_s = round(time.perf_counter() - solve_start, 3)
+            records, files = solve_stats.finish()
             if superseded():
                 self.get_logger().info(
                     f"Dropping the plan for a superseded {name} goal"
+                )
+                self.log_event(
+                    "plan.superseded",
+                    {
+                        "request": request,
+                        "plugin": name,
+                        "stage": "after planning",
+                        "solve_s": solve_s,
+                    },
                 )
                 done_planning()
                 return
@@ -591,12 +787,36 @@ class OmniPlannerRos(Node):
                     f"{name}: {reason}; dispatching nothing to {sorted(plan_dict)}"
                 )
                 done_planning()
+                self._log_plan_failed(
+                    name,
+                    plugin,
+                    request,
+                    reason,
+                    records,
+                    files,
+                    solve_s,
+                    satisfied=True,
+                    robots=sorted(plan_dict),
+                )
                 self.plan_failed_pub.publish(String(data=f"{name}: {reason}"))
                 self.publish_plan_status(name, msg, False, reason)
                 return
 
+            self._log_plan_solved(
+                name, plugin, request, plan_dict, records, files, solve_s
+            )
             for robot_name, compiled_plan in plan_dict.items():
                 self.robot_adaptors[robot_name].publish_plan(to_msg(compiled_plan))
+                self.log_event(
+                    "plan.published",
+                    {
+                        "request": request,
+                        "robot": robot_name,
+                        "plan_id": getattr(compiled_plan, "plan_id", "") or "",
+                        "empty": plan_is_empty(compiled_plan),
+                    },
+                    plan_id=getattr(compiled_plan, "plan_id", "") or "",
+                )
                 # TODO: combine markers into single array so that latching works
                 # correctly for multi-robot plans?
                 self.compiled_plan_viz_pub.publish(
