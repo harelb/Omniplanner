@@ -19,6 +19,23 @@ from typing import Dict, List
 
 import numpy as np
 
+# a FOLLOW / PATH polyline in the event is downsampled to at most this many
+# points (cm), enough to draw the plan in the mission replay
+MAX_PATH_POINTS = 40
+
+
+def downsample(points, max_points: int = MAX_PATH_POINTS) -> List[List[float]]:
+    """At most ``max_points`` [x, y] rows of a polyline (first and last kept)."""
+    if points is None:
+        return []
+    xy = np.asarray(points, dtype=float)
+    if xy.ndim != 2 or len(xy) == 0 or xy.shape[1] < 2:
+        return []
+    if len(xy) > max_points:
+        idx = np.unique(np.linspace(0, len(xy) - 1, max_points).round().astype(int))
+        xy = xy[idx]
+    return [[round(float(x), 2), round(float(y), 2)] for x, y in xy[:, :2]]
+
 
 def polyline_length(points) -> float:
     """Length of a polyline of [x, y, ...] rows, in x/y only."""
@@ -61,6 +78,7 @@ def describe_action(action) -> dict:
         path = getattr(action, "path2d", None)
         out["n_points"] = 0 if path is None else int(len(path))
         out["len_m"] = round(polyline_length(path), 2)
+        out["path"] = downsample(path)
     else:
         for key in ("object_id", "object_class"):
             value = getattr(action, key, "")
@@ -82,6 +100,7 @@ def describe_plan(plan) -> List[dict]:
                 "type": "PATH",
                 "n_points": len(points),
                 "len_m": round(polyline_length(points), 2),
+                "path": downsample(points),
             }
         ]
     return [describe_action(a) for a in getattr(plan, "actions", None) or []]

@@ -157,6 +157,12 @@ def test_path_length_of_a_compiled_plan():
     assert summary["actions"]["euclid"][1]["object_id"] == "o12"
     assert summary["actions"]["euclid"][0]["len_m"] == 7.0
     assert summary["path_len_m_total"] == pytest.approx(23.0)
+    # the replay draws the plan: each polyline, downsampled
+    path = summary["actions"]["euclid"][0]["path"]
+    assert path[0] == [0.0, 0.0] and len(path) >= 2
+    assert summary["actions"]["gauss"][0]["path"]
+    long = plan_summary.downsample([[i, 0] for i in range(500)])
+    assert len(long) == plan_summary.MAX_PATH_POINTS and long[-1] == [499.0, 0.0]
 
 
 # ---------- plan.request / plan.solved / plan.published ----------
