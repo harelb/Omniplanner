@@ -304,6 +304,7 @@ def isolated_dumps(tmp_path, monkeypatch):
     """Point both debug-dump destinations at a tmp dir."""
     monkeypatch.setenv("OMNIPLANNER_DUMP_DIR", str(tmp_path / "dumps"))
     monkeypatch.setenv("ADT4_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.delenv("ADT4_RUN_DIR", raising=False)
     return tmp_path
 
 
@@ -313,7 +314,7 @@ def test_solve_pddl_unsolvable_raises_typed_error(isolated_dumps):
         solve_pddl(_problem(UNSOLVABLE_PROBLEM))
     assert exc_info.value.returncode in (10, 11, 12)
     # the debug problem file is still written before raising
-    assert (isolated_dumps / "pddl_problem_debugging.pddl").exists()
+    assert (isolated_dumps / "pddl_problem_debugging_latest.pddl").exists()
 
 
 @needs_fd
@@ -379,6 +380,9 @@ def test_solve_pddl_maps_returncode(returncode, expected, isolated_dumps, monkey
         solve_pddl(_problem(UNSOLVABLE_PROBLEM))
     assert type(exc_info.value) is expected
     assert exc_info.value.returncode == returncode
-    debug_fn = isolated_dumps / "pddl_problem_debugging.pddl"
-    assert debug_fn.exists()
+    # a timestamped file, never overwritten; _latest is a symlink to it
+    latest = isolated_dumps / "pddl_problem_debugging_latest.pddl"
+    assert latest.is_symlink()
+    debug_fn = latest.resolve()
+    assert debug_fn.name.startswith("pddl_problem_debugging_2")
     assert debug_fn.read_text() == UNSOLVABLE_PROBLEM

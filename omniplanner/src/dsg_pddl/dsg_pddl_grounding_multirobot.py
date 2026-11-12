@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-import time
 from collections.abc import Mapping
 from typing import Any, Dict, List, Tuple
 
@@ -28,6 +27,7 @@ from dsg_pddl.dsg_pddl_grounding import (
     simplify,
     symbol_connectivity_to_pddl,
 )
+from dsg_pddl.dump_files import dump_stamp, env_dump_dir, point_latest
 from dsg_pddl.grounding_errors import (
     GoalSymbolNotInMapError,
     MissingSymbol,
@@ -46,6 +46,7 @@ from dsg_pddl.pddl_utils import (
     lisp_string_to_ast,
     pddl_symbol_to_node_symbol,
 )
+from omniplanner import solve_stats
 from omniplanner.omniplanner import MultiRobotWrapper
 from omniplanner.tsp import LayerPlanner
 from omniplanner.world_state import goal_tokens, unavailable_robots
@@ -741,18 +742,21 @@ def _failure_hint(
 
 
 def _dump_problem(problem_str):
+    """<ts>_<uuid8>_mr_region_problem.pddl, never overwritten;
+    mr_region_problem_latest.pddl is a symlink to the newest. See dump_files
+    for the directory."""
     try:
-        dump_dir = os.environ.get(
-            "PDDL_DUMP_DIR", os.path.join(os.getcwd(), "pddl_dumps")
+        dump_dir = env_dump_dir("PDDL_DUMP_DIR", "OMNIPLANNER_DUMP_DIR") or (
+            os.path.join(os.getcwd(), "pddl_dumps")
         )
         os.makedirs(dump_dir, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
+        ts = dump_stamp("%Y%m%d_%H%M%S")
         persistent_problem = os.path.join(dump_dir, f"{ts}_mr_region_problem.pddl")
         latest_problem = os.path.join(dump_dir, "mr_region_problem_latest.pddl")
         with open(persistent_problem, "w") as f:
             f.write(problem_str)
-        with open(latest_problem, "w") as f:
-            f.write(problem_str)
+        point_latest(latest_problem, persistent_problem)
+        solve_stats.note_file("mr_region_problem", persistent_problem)
         logger.info(f"Saved multi-robot region PDDL to {persistent_problem}")
     except Exception as e:
         logger.warning(f"Failed to persist multi-robot region PDDL dump: {e}")

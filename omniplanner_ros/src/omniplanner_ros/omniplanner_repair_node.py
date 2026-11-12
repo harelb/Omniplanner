@@ -105,6 +105,7 @@ from robot_executor_msgs.msg import ActionDoneMsg
 from std_msgs.msg import Bool, Int64, String
 from std_srvs.srv import Trigger
 
+from omniplanner_ros.eventlog_ros import emit_event
 from omniplanner_ros.omniplanner_node import OmniPlannerRos, plan_is_empty
 
 # robot_type values whose plan is a nav_msgs/Path (a Husky running phoenix).
@@ -115,6 +116,33 @@ def plan_ids(plan_dict):
     """{robot: plan_id} of compiled plans. A phoenix (husky) plan is a
     nav_msgs/Path, which has no plan_id: it maps to ""."""
     return {r: getattr(p, "plan_id", "") or "" for r, p in plan_dict.items()}
+
+
+def _event(node, type, payload=None, **ids) -> None:
+    emit_event(node, "omniplanner", type, payload, **ids)
+
+
+def _log_replan_trigger(node, reason: str) -> None:
+    """repair.trigger, with the map and the plans it was judged on."""
+    try:
+        epoch, version = node._map_state()
+        with node._plan_lock:
+            robots = list(node._plan_robots)
+            plans = dict(node._plan_ids)
+        _event(
+            node,
+            "repair.trigger",
+            {
+                "reason": reason,
+                "map_version": version,
+                "epoch": epoch,
+                "generation": node._map_version(),
+                "robots": robots,
+                "plan_ids": plans,
+            },
+        )
+    except Exception:
+        pass
 
 
 class OmniPlannerRepairRos(OmniPlannerRos):
@@ -394,6 +422,14 @@ class OmniPlannerRepairRos(OmniPlannerRos):
                 f"could not reach {', '.join(missed)} to stop it (nothing "
                 f"subscribes to its pause or plan topic): {reason}"
             )
+        for robot in paused:
+            _event(self, "pause", {"robot": robot, "reason": reason})
+        for robot in stopped:
+            _event(
+                self, "pause", {"robot": robot, "reason": reason, "how": "empty path"}
+            )
+        for robot in missed:
+            _event(self, "pause", {"robot": robot, "reason": reason, "reached": False})
         return paused + stopped
 
     def _pause_pub_for(self, robot: str):
@@ -426,6 +462,18 @@ class OmniPlannerRepairRos(OmniPlannerRos):
         else:
             what = f"map_version {old[1]} -> {new[1]}"
         self.get_logger().info(f"{what} (generation {self._map_generation}): {verdict}")
+        _event(
+            self,
+            "map.version",
+            {
+                "map_epoch": new[0],
+                "map_version": new[1],
+                "generation": self._map_generation,
+                "reloaded": reloaded,
+                "first": old is None,
+                "verdict": verdict,
+            },
+        )
         if old is not None and not reloaded and new[1] != old[1]:
             self._expect_announcement(new[1], verdict)
 
@@ -618,6 +666,7 @@ class OmniPlannerRepairRos(OmniPlannerRos):
 
     def _request_replan(self, reason: str) -> None:
         self.get_logger().warning(f"plan invalidated: {reason}; requesting a replan")
+        _log_replan_trigger(self, reason)
         self._replan_pub.publish(String(data=reason))
 
     def _reset_mission_state_callback(self, request, response):
@@ -920,6 +969,19 @@ class OmniPlannerRepairRos(OmniPlannerRos):
                 "reported no action. Check the robot, or send the goal again."
             )
             self.get_logger().warning(text)
+            _event(
+                self,
+                "progress.stall",
+                {
+                    "robot": robot,
+                    "plan_id": sent["plan_id"],
+                    "idle_s": round(now - sent["last_progress"], 1),
+                    "reached": int(sent["reached"]) + 1,
+                    "steps": int(sent["steps"]),
+                    "text": text,
+                },
+                plan_id=sent["plan_id"],
+            )
             self._progress_pub.publish(String(data=text))
 
     def _publish_path_status(self, robot, sent, status) -> None:
